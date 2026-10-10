@@ -196,18 +196,38 @@ class WindMCPClient:
         params: Dict[str, Any],
     ) -> pd.DataFrame:
         """
-        调用返回 columns/rows 表格结构的工具（如行情、K线），解析为 DataFrame。
-        返回结构: {"data": {"columns": [{"name": ...}], "rows": [[...]], "unit": {...}}}
+        调用返回表格结构的工具，解析为 DataFrame。兼容两种实测形态：
+        - 扁平: {"data": {"columns": [...], "rows": [...]}}        （行情、K线）
+        - 嵌套: {"data": {"data": [{"columns": ...}, ...]}}        （fundamentals/technicals 等自然语言工具）
+        多张嵌套表按序纵向拼接（列名不同时按列名对齐，缺列填 NaN）。
         """
         payload = self.call(server_type, tool_name, params)
         data = payload.get("data")
         if not isinstance(data, dict):
             return pd.DataFrame()
-        columns = [c.get("name") for c in (data.get("columns") or [])]
-        rows = data.get("rows") or []
-        if not columns or not rows:
+
+        tables: List[Dict[str, Any]] = []
+        if isinstance(data.get("data"), list):
+            # 嵌套形态：data.data 是表格列表
+            for item in data["data"]:
+                if isinstance(item, dict) and item.get("columns") and item.get("rows"):
+                    tables.append(item)
+        elif data.get("columns") and data.get("rows"):
+            # 扁平形态
+            tables.append(data)
+
+        if not tables:
             return pd.DataFrame()
-        return pd.DataFrame(rows, columns=columns)
+
+        frames = []
+        for t in tables:
+            columns = [c.get("name") for c in (t.get("columns") or [])]
+            rows = t.get("rows") or []
+            if columns and rows:
+                frames.append(pd.DataFrame(rows, columns=columns))
+        if not frames:
+            return pd.DataFrame()
+        return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
 
     def call_items(
         self,
