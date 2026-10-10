@@ -13,6 +13,7 @@ from .tushare_adapter import TushareAdapter
 from .akshare_adapter import AKShareAdapter
 from .baostock_adapter import BaoStockAdapter
 from .qmt_adapter import QMTAdapter
+from .wind_adapter import WindAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class DataSourceManager:
             AKShareAdapter(),
             BaoStockAdapter(),
             QMTAdapter(),        # 迅投 QMT（需 QMT 运行，新闻用 AKShare）
+            WindAdapter(),       # Wind 万得（MCP skill 接入，按积分计费）
         ]
 
         # 使用统一的数据源优先级模块加载配置

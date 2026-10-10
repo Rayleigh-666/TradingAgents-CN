@@ -214,12 +214,14 @@ DATA_SOURCE_REGISTRY: Dict[str, DataSourceInfo] = {
         name="Wind",
         display_name="Wind 万得",
         provider="Wind 万得",
-        description="专业金融终端，提供全面的金融数据和分析工具",
-        supported_markets=["a_shares", "hk_stocks", "us_stocks"],
-        requires_api_key=True,
-        is_free=False,  # 专业版需付费
+        description="专业金融终端数据（经 wind-mcp-skill MCP CLI 接入），"
+                    "覆盖A股/港股/美股/基金/指数/债券/宏观，按积分计费",
+        supported_markets=["a_shares", "hk_stocks", "us_stocks", "funds", "indices", "bonds"],
+        requires_api_key=True,  # API Key 由 wind-mcp-skill 自行管理
+        is_free=False,  # 按积分计费
         official_website="https://www.wind.com.cn",
-        features=["专业数据", "全市场覆盖", "高质量数据", "专业分析"],
+        features=["K线与实时行情", "新闻公告", "财务估值", "宏观数据",
+                  "全市场覆盖", "需本地 MCP CLI", "按积分计费"],
     ),
     
     # QMT (迅投)
