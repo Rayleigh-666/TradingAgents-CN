@@ -35,6 +35,14 @@ class PlaceOrderRequest(BaseModel):
     analysis_id: Optional[str] = None
 
 
+# 美股「交易所/板块」后缀（出现在末段）。与 app/routers/stocks.py 的
+# `_US_EXCH_SUFFIXES`、app/worker/hk_us_preheat_service.py 的
+# `_WIND_US_EXCH_SUFFIXES` 保持一致，三处改动需同步。
+# **刻意不含单字母 A/B/C** —— 那正是股份类别的写法（BRK.A / BRK.B）。
+_US_EXCH_SUFFIXES = {"O", "N", "BAT", "OO", "NQ", "OB", "OQ",
+                     "PK", "AM", "GI", "HI"}
+
+
 def _detect_market_and_code(code: str) -> Tuple[str, str]:
     """
     检测股票代码的市场类型并标准化代码
@@ -43,7 +51,8 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
         (market, normalized_code): 市场类型和标准化后的代码
             - CN: A股（6位数字）
             - HK: 港股（4-5位数字或带.HK后缀）
-            - US: 美股（字母代码）
+            - US: 美股（1-5位字母；可带股份类别 BRK.B / BRK-B，
+                 或交易所后缀 AAPL.O / CBOE.BAT，后者会被剥掉）
     """
     code = code.strip().upper()
 
@@ -51,8 +60,18 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
     if code.endswith('.HK'):
         return ('HK', code[:-3].zfill(5))
 
+    # 美股：1-5位字母 + 股份类别（BRK.B / BRK-B → BRK.B）或交易所后缀（AAPL.O → AAPL）
+    # ⚠️ 必须放在「默认 A 股」之前，否则 BRK.B 会被误判成 A 股代码走 A 股链路
+    cls_match = re.match(r'^([A-Z]{1,5})[.\-]([A-Z]{1,3})$', code)
+    if cls_match:
+        base, tail = cls_match.group(1), cls_match.group(2)
+        if tail in _US_EXCH_SUFFIXES:
+            return ('US', base)                    # AAPL.O / CBOE.BAT → AAPL / CBOE
+        if len(tail) == 1:
+            return ('US', f"{base}.{tail}")        # BRK.B / BRK-B → BRK.B
+
     # 美股：纯字母
-    if re.match(r'^[A-Z]+$', code):
+    if re.match(r'^[A-Z]{1,5}$', code):
         return ('US', code)
 
     # 港股：4-5位数字

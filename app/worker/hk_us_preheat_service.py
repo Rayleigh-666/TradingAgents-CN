@@ -111,6 +111,15 @@ _HK_CHARS = list("0123456789")
 
 UNIVERSE_COLLECTION = "hk_us_preheat_universe"
 
+# 成分清单「暴跌保护」：本次取到的成分数低于库内现有数的该比例时，判定为上游
+# 部分拉取失败，跳过清理（保留旧清单，下次成功刷新自愈）。
+# 背景：港股通 / 标普 500 成分数超过 Wind 单次查询上限，按首字母分批拉取，
+# 某一桶瞬时失败会让 members 大幅偏少，此时若照常 _prune_source，
+# 缺失桶里的成分会被误摘标签、失去全部来源者还会被 enabled=False（少预热一批）。
+_INDEX_SHRINK_GUARD = 0.8
+# 存量低于该规模时不做暴跌保护（首次建立、或小指数正常波动占比也会很大）
+_MIN_INDEX_MEMBERS_FOR_PRUNE = 20
+
 # Wind 用于标记「已退市/已失效」证券的后缀字符
 _DELISTED_MARK = "!"
 # Wind 证券简称中的退市标记（如「艾芙隆海湾社区(AVALONBAY)(退市)」）。
@@ -154,16 +163,19 @@ _WIND_US_EXCH_RE = re.compile(r"\.(?:" + "|".join(sorted(_WIND_US_EXCH_SUFFIXES)
 
 def _us_ticker(windcode: str) -> str:
     """
-    Wind 美股代码 → 内部 ticker（股份类别分隔符统一为点号「.」）
+    Wind / 自选股美股代码 → 内部 ticker（股份类别分隔符统一为点号「.」）
         AAPL.O  → AAPL
         BRK_B.N → BRK.B   （Wind 用下划线表示股份类别；Yahoo 用连字符）
         BRK.B   → BRK.B
+        BRK-B   → BRK.B   （自选股可能存 Yahoo 风格连字符，须归一，
+                             否则会与指数侧的 BRK.B 变成两条 universe 记录）
     """
     code = (windcode or "").strip().upper()
     parts = code.split(".")
     if len(parts) >= 2 and parts[-1] in _WIND_US_EXCH_SUFFIXES:
         parts = parts[:-1]
-    return ".".join(parts).replace("_", ".")
+    # 下划线（Wind）与连字符（Yahoo）都归一点号，三处格式统一到「BRK.B」
+    return ".".join(parts).replace("_", ".").replace("-", ".")
 
 
 def to_internal_symbol(windcode: str, market: str) -> str:
@@ -320,6 +332,19 @@ class HKUSPreheatService:
                 logger.warning(f"⚠️ 指数 {idx_name} 未取到任何成分股（保留库内旧清单，不清理）")
                 stats[source_tag] = await coll.count_documents(
                     {"sources": source_tag, "enabled": True})
+                continue
+
+            # ⚠️ 部分拉取保护：成分数相对库内现有清单暴跌 → 疑似上游分批拉取有桶失败，
+            #    此时清理会误摘缺失桶的成分，故跳过（保留旧清单，下次刷新自愈）。
+            existing_n = await coll.count_documents(
+                {"sources": source_tag, "enabled": True})
+            if (existing_n >= _MIN_INDEX_MEMBERS_FOR_PRUNE
+                    and len(members) < existing_n * _INDEX_SHRINK_GUARD):
+                logger.warning(
+                    f"⚠️ 指数 {idx_name} 本次仅取到 {len(members)} 只，不足库内 "
+                    f"{existing_n} 只的 {_INDEX_SHRINK_GUARD:.0%}，疑似上游分批拉取"
+                    f"部分失败 → 跳过清理（保留旧清单）")
+                stats[source_tag] = existing_n
                 continue
 
             ops = []
@@ -826,7 +851,11 @@ class HKUSPreheatService:
         (1) Yahoo 覆盖过薄（上游缺口）→ 按**完整 lookback** 用 Wind 补齐，
             仅当「Wind 行数 > Yahoo 行数 且 > 库内现有行数」才整源切换；
         (2) 否则过滤出「> 库内最新交易日」的 Yahoo 新增行写库；
-        (3) Yahoo 完全无数据 → Wind 单只兜底。
+        (3) Yahoo 完全无数据 → Wind 单只兜底。库内已有历史时走幂等 upsert
+            （只补增量、按日期清异源），绝不用整源切换砍掉历史。
+
+        不变式：**已存历史永不缩短**。整源切换只出现在「按完整 lookback 取数且
+        行数确实更多」的场景，另由 `_write_single_source` 的 `allow_shrink` 兜底。
         """
         t, coll, last = p["t"], p["coll"], p["last"]
         mk, symbol = t["market"], t["symbol"]
@@ -846,7 +875,8 @@ class HKUSPreheatService:
                         self._wind_kline, t["windcode"], max(p["limit"], p["lookback"]))
                     if w_items and len(w_items) > max(len(raw), existing):
                         rows_written = await self._write_single_source(
-                            coll, t, w_items, "wind", from_scratch=True)
+                            coll, t, w_items, "wind", from_scratch=True,
+                            allow_shrink=force_full)
                         used = "wind"
 
             if used is None:
@@ -861,14 +891,28 @@ class HKUSPreheatService:
                     stats["skipped"] += 1
                 elif allow_wind:
                     # (3) Yahoo 完全没数据 → Wind 单只兜底
+                    #     ⚠️ 库内已有历史时**不得**走整源切换：本次只取增量小窗
+                    #     （gap+5 天，可能仅几天），而 `_write_single_source` 会先
+                    #     delete_many 掉该 symbol 的全部异源行 → 250 根 Yahoo 历史
+                    #     被砍成几根。此处改走幂等 upsert（按日期精确清异源），
+                    #     历史永不缩短；只有「首次建仓 / force_full 重建」才整源写入，
+                    #     且必须按完整 lookback 取数以保证深度。
+                    has_history = bool(last) and not force_full
+                    w_limit = p["limit"] if has_history \
+                        else max(p["limit"], p["lookback"])
                     w_items = await asyncio.to_thread(
-                        self._wind_kline, t["windcode"], p["limit"])
-                    if w_items and last and not force_full:
+                        self._wind_kline, t["windcode"], w_limit)
+                    if w_items and has_history:
                         w_items = [it for it in w_items
                                    if (it.get("date") or "") > last]
                     if w_items:
-                        rows_written = await self._write_single_source(
-                            coll, t, w_items, "wind", from_scratch=force_full)
+                        if has_history:
+                            rows_written = await self._upsert_daily(
+                                coll, w_items, t, "wind", from_scratch=False)
+                        else:
+                            rows_written = await self._write_single_source(
+                                coll, t, w_items, "wind", from_scratch=force_full,
+                                allow_shrink=force_full)
                         used = "wind"
                     elif last and not force_full:
                         stats["skipped"] += 1
@@ -1202,14 +1246,36 @@ class HKUSPreheatService:
 
     async def _write_single_source(self, coll, target: Dict[str, str],
                                    items: List[Dict[str, Any]], source: str,
-                                   from_scratch: bool = False) -> int:
+                                   from_scratch: bool = False,
+                                   allow_shrink: bool = False) -> int:
         """
         把该 symbol 的日线整体切换为**单一来源**后写入。
 
         唯一键含 data_source，若同一标的先后由 Yahoo / Wind 写入，同一交易日会出现
         两条记录，K 线接口会返回重复日期。故切换来源时先清掉其它来源的旧行。
         前收在删除前先取出，保证增量链式涨跌不被破坏。
+
+        ⚠️ 本函数会删除该 symbol 的**全部异源行**，只适用于「整源切换」：
+        - 调用方须保证本次 items 的数据深度不逊于库内异源历史（如分支 (1) 的
+          `len(w_items) > max(len(raw), existing)` 前置判断）；
+        - 若只是想「Yahoo 挂了、用 Wind 补最新几根」，必须改走 `_upsert_daily`
+          （按日期精确清异源），否则会把 250 根历史砍成几根；
+        - 兜底：`allow_shrink=False` 时若本次行数少于库内异源行数，直接拒绝切换并
+          返回 0，守住「已存历史永不缩短」不变式。仅 force_full 全量重建传
+          `allow_shrink=True`。
         """
+        items = [it for it in items
+                 if it.get("date") and _to_float(it.get("close")) is not None]
+        if not items:
+            return 0
+        other_rows = await coll.count_documents(
+            {"symbol": target["symbol"], "data_source": {"$ne": source}})
+        if not allow_shrink and other_rows > len(items):
+            logger.warning(
+                f"⚠️ {target['market']}:{target['symbol']} 拒绝整源切换 → {source}："
+                f"本次 {len(items)} 行 < 库内异源 {other_rows} 行，"
+                f"切换会导致历史缩短（已保历史优先跳过）")
+            return 0
         now = datetime.now()
         prev_close = None
         if not from_scratch:

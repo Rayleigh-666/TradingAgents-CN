@@ -734,6 +734,68 @@ US 财务那 9 只 stale 正是 §10.5 提到的「Wind 无有效命中」标的
 故未额外引入失败标记机制。若后续需要彻底消除，可给失败记录写一个 `attempted_at`
 并为其设置更长的重试周期（例如 3 天）。
 
+## 13. 第二轮交叉 Review 修正记录（v6）
+
+评审报告：`reports/2026-10-11-cross-review-round2.md`（范围 `fcc61a8c..c4fec099`）。
+逐项核验后落实如下（含 2 处对报告的更正）。
+
+### 13.1 P0：设计文档再次被旧 buffer 覆盖 —— 已恢复
+
+工作区版本 685 行、缺第 12 节（HEAD 749 行）；忽略空白后仍差 122 行（29 增 / 93 删），
+确认是被编辑器旧 buffer 覆盖而非单纯格式重排。已 `git restore` 回 HEAD，
+本地版本另存 `/tmp/hk-us-preheat-cache.worktree-backup.md` 备查。
+
+> 根因是该文件的 format-on-save + 旧 buffer，已两次闯祸。建议关闭其自动格式化，
+> 或提交前必跑 `git status`。
+
+### 13.2 P1（新发现）：分支 (3) 的 Wind 兜底会把历史砍短 —— 已修
+
+`_write_daily_target` 分支 (3)（Yahoo 完全无数据 → Wind 兜底）用**增量小窗**
+`p["limit"]` 取数，却调用 `_write_single_source`；后者会先 `delete_many` 掉该 symbol
+的**全部异源行**。当库内已有 Yahoo 历史、且 last 落后于最新交易日时，250 根历史会被
+几根 Wind 数据替换。批量化下一批 60 只整批失败会同时中招。
+
+**对报告的两点更正**：
+
+1. 报告称 `_sync_daily_per_symbol` 分支 (b) 同样受影响 —— **实际不成立**。该路径用的是
+   `_upsert_daily`（按日期精确清异源），不会缩短历史；`_write_single_source` 全仓库只有
+   2 个调用点，都在 `_write_daily_target` 内。
+2. 报告建议「改用 `max(p["limit"], p["lookback"])`」只解决「深度不缩水」，但仍是
+   **整源切换**（把历史来源整体替换）。按语义区分更准确：
+
+| 场景 | 取数窗口 | 写入方式 |
+| --- | --- | --- |
+| 库内已有历史（补增量） | `p["limit"]` | **`_upsert_daily`**（按日期清异源，历史保留） |
+| 库内无历史（首次建仓） | `max(limit, lookback)` | `_write_single_source` |
+| `force_full`（重建） | `max(limit, lookback)` | `_write_single_source(allow_shrink=True)` |
+
+另在 `_write_single_source` 内加最后一道闸：`allow_shrink=False` 时若「本次行数 < 库内
+异源行数」直接拒绝切换并返回 0（记 warning），守住「已存历史永不缩短」不变式。
+
+### 13.3 P2：`paper.py` 第三份市场识别未同步 —— 已修
+
+`app/routers/paper.py` 的 `_detect_market_and_code` 已与 `stocks.py` 对齐
+（点号/连字符类股票 + 交易所后缀处理）。三处实现现已一致，各处注释标注「改动需同步」。
+
+### 13.4 P3 五项
+
+| 项 | 处理 |
+| --- | --- |
+| P3-1 自选股 `BRK-B` 不归一 | 已修：`_us_ticker` 增加 `.replace("-", ".")`，下划线/连字符都归一点号。避免自选股 `BRK-B` 与指数侧 `BRK.B` 分裂成两条 universe 记录（后者还永远命中不了缓存） |
+| P3-2 `AAPL.O` 被当股份类别 | 已修：`stocks.py` / `paper.py` 的类别分支改为先判交易所后缀（`_US_EXCH_SUFFIXES`）再判单字母类别 → `AAPL.O → AAPL`、`CBOE.BAT → CBOE` |
+| P3-3 `_prune_source` 对部分拉取敏感 | 已修：新增「成分数暴跌保护」——本次 members 低于库内现有数的 80%（且存量 ≥ 20）时跳过清理并告警，保留旧清单下次自愈 |
+| P3-4 测试未落库 | 已补 `tests/test_hk_us_preheat_codes.py`（13 例：代码转换 / 历史不变式 / 暴跌保护 / 三处市场识别一致性） |
+| P3-5 无效行导致 prev_close 跳格 | **误报，无需修**：`_build_daily_ops` 遇无收盘价行直接 `continue`，`prev_close` 保持上一**有效**行的收盘，下一有效行衔接正确（已补测试固化该行为） |
+
+### 13.5 回归验证
+
+| 验证项 | 结果 |
+| --- | --- |
+| 新增代码/不变式测试 | `tests/test_hk_us_preheat_codes.py` 13/13 通过 |
+| 节流测试（上一轮） | `tests/test_hk_us_preheat_meta_throttle.py` 10/10 通过（无回归） |
+| 市场识别一致性 | `BRK.B` / `BRK-B` / `AAPL.O` / `CBOE.BAT` / `GOOGL.OQ` 在两份实现下输出完全一致 |
+| 历史不变式 | 构造「20 根历史 + 1 行新数据」→ 拒绝切换、历史原样保留 |
+
 ## 附：本次勘察的代码索引
 
 | 位置                                                | 内容                                       |

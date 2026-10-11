@@ -353,6 +353,15 @@ def _aggregate_etf_kline_rows(rows: List[Dict[str, Any]], period: str, limit: in
     return items[-limit:]
 
 
+# 美股「交易所/板块」后缀（出现在末段）。与
+# app/worker/hk_us_preheat_service.py 的 `_WIND_US_EXCH_SUFFIXES` 保持一致，
+# 改动时需同步（该处负责从 Wind 代码剥后缀，此处负责用户输入的标准化）。
+# **刻意不含单字母 A/B/C** —— 那正是股份类别的写法（BRK.A / BRK.B），
+# 收了会把 `BRK.B` 剥成 `BRK`（Yahoo 的 BRK 是 A 类行情）。
+_US_EXCH_SUFFIXES = {"O", "N", "BAT", "OO", "NQ", "OB", "OQ",
+                     "PK", "AM", "GI", "HI"}
+
+
 def _detect_market_and_code(code: str) -> Tuple[str, str]:
     """
     检测股票代码的市场类型并标准化代码
@@ -373,10 +382,16 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
         return ('HK', code[:-3].zfill(5))  # 移除.HK，补齐到5位
 
     # 美股：1-5位字母 + 股份类别（BRK.B / BRK-B → 统一存为 BRK.B）
+    #      或 + 交易所后缀（AAPL.O → AAPL，剥掉后缀才能命中预热缓存）
     # ⚠️ 必须放在「默认 A 股」之前，否则 BRK.B 会被误判成 A 股代码走 A 股链路
-    cls_match = re.match(r'^([A-Z]{1,5})[.\-]([A-Z])$', code)
+    cls_match = re.match(r'^([A-Z]{1,5})[.\-]([A-Z]{1,3})$', code)
     if cls_match:
-        return ('US', f"{cls_match.group(1)}.{cls_match.group(2)}")
+        base, tail = cls_match.group(1), cls_match.group(2)
+        if tail in _US_EXCH_SUFFIXES:
+            return ('US', base)                    # AAPL.O / CBOE.BAT → AAPL / CBOE
+        if len(tail) == 1:
+            return ('US', f"{base}.{tail}")        # BRK.B / BRK-B → BRK.B
+        # 多字母且非已知交易所后缀：不认，交给后续分支（最终按默认 A 股处理）
 
     # 美股：纯字母
     if re.match(r'^[A-Z]{1,5}$', code):
