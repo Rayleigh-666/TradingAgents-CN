@@ -388,6 +388,22 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
     return ('CN', _zfill_code(code))
 
 
+# 预热缓存陈旧阈值（自然日）。超过该天数的最新缓存视为不可信，跳过缓存走实时源。
+# 取值宽松，避免港股/美股长假（圣诞、春节等）被误判。
+_PREHEAT_STALE_DAYS = 15
+
+
+def _preheat_cache_stale(latest_trade_date: Optional[str]) -> bool:
+    """判断港股/美股预热缓存是否已陈旧（无法解析日期时按陈旧处理，回退实时源）"""
+    if not latest_trade_date:
+        return True
+    try:
+        latest = datetime.strptime(str(latest_trade_date)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return True
+    return (date.today() - latest).days > _PREHEAT_STALE_DAYS
+
+
 @router.get("/{code}/quote", response_model=dict)
 async def get_quote(
     code: str,
@@ -962,11 +978,47 @@ async def get_kline(
     # 检测市场类型
     market, normalized_code = _detect_market_and_code(code)
 
-    # 港股和美股：使用新服务
+    # 港股和美股：优先读 MongoDB 预热缓存，未命中再走 ForeignStockService
     if market in ['HK', 'US']:
+        db = get_mongo_db()  # 不需要 await，直接返回数据库对象
+
+        # 【预热缓存】日线命中即返回（零外部调用）。
+        # 缓存由 app/worker/hk_us_preheat_service.py 定时写入：
+        #   stock_daily_quotes_hk / stock_daily_quotes_us，period='daily'
+        # 陈旧保护：最新一条超过 _PREHEAT_STALE_DAYS 天视为不可信，跳过缓存走实时。
+        if period == 'day':
+            coll_name = "stock_daily_quotes_hk" if market == 'HK' else "stock_daily_quotes_us"
+            try:
+                rows = await db[coll_name].find(
+                    {"symbol": normalized_code, "period": "daily"},
+                    {"_id": 0, "trade_date": 1, "open": 1, "high": 1,
+                     "low": 1, "close": 1, "volume": 1, "amount": 1},
+                ).sort("trade_date", -1).to_list(length=max(1, int(limit)))
+            except Exception as e:
+                logger.warning(f"预热缓存查询失败 {market}:{normalized_code}: {e}")
+                rows = []
+
+            if rows and not _preheat_cache_stale(rows[0].get("trade_date")):
+                rows.reverse()  # 库内按倒序取，返回前转正序
+                items = [{
+                    'date': r.get('trade_date'),
+                    'trade_date': r.get('trade_date'),
+                    'open': r.get('open'),
+                    'high': r.get('high'),
+                    'low': r.get('low'),
+                    'close': r.get('close'),
+                    'volume': r.get('volume'),
+                    'amount': r.get('amount'),
+                } for r in rows]
+                return ok(data={
+                    'code': normalized_code,
+                    'period': period,
+                    'items': items,
+                    'source': 'mongodb_preheat'
+                })
+
         from app.services.foreign_stock_service import ForeignStockService
 
-        db = get_mongo_db()  # 不需要 await，直接返回数据库对象
         service = ForeignStockService(db=db)
 
         try:

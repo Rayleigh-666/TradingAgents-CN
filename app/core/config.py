@@ -274,6 +274,41 @@ class Settings(BaseSettings):
     FAVORITES_DATA_SYNC_ENABLED: bool = Field(default=True, description="启用股票关注列表A股数据同步")
     FAVORITES_DATA_SYNC_CRON: str = Field(default="0 19 * * 1-5", description="股票关注列表A股数据同步CRON表达式（交易日晚上7点）")
 
+    # ==================== 港股/美股行情预热缓存 ====================
+    # 港美股在后端无 MongoDB 缓存，每次分析都实时打外部 API。
+    # 本组配置驱动「指数成分股 ∪ 自选股」的日线/基础信息/财务预热同步。
+    HK_US_PREHEAT_ENABLED: bool = Field(
+        default=True, description="启用港股/美股行情预热缓存同步"
+    )
+    HK_PREHEAT_CRON: str = Field(
+        default="30 17 * * 1-5", description="港股预热同步CRON（港股16:00收盘后）"
+    )
+    US_PREHEAT_CRON: str = Field(
+        default="0 7 * * 1-5", description="美股预热同步CRON（北京时间收盘后，留缓冲）"
+    )
+    HK_US_PREHEAT_LOOKBACK_DAYS: int = Field(
+        default=365, ge=1, le=3650, description="首次预热回看的自然日天数"
+    )
+    HK_US_PREHEAT_PRIMARY_SOURCE: str = Field(
+        default="yahoo", description="预热主数据源（yahoo | wind），另一个自动作为降级备源"
+    )
+    HK_US_PREHEAT_ENABLE_FINANCIAL: bool = Field(
+        default=True, description="预热时同步港美股财务数据"
+    )
+    HK_US_PREHEAT_ENABLE_BASIC_INFO: bool = Field(
+        default=True, description="预热时同步港美股基础信息"
+    )
+    HK_US_PREHEAT_BATCH_SLEEP_SECONDS: float = Field(
+        default=0.15, ge=0, le=5, description="批量同步时每只标的之间的间隔（秒），用于限流保护"
+    )
+    HK_US_PREHEAT_UNIVERSE_REFRESH_DAYS: int = Field(
+        default=7, ge=1, le=90, description="指数成分清单的最大缓存天数，超过则重新反查"
+    )
+    HK_US_PREHEAT_INDEXES: str = Field(
+        default="恒生指数,恒生科技,港股通,纳斯达克100,标普500",
+        description="预热覆盖的指数清单（逗号分隔）。港股通/标普500 成分数超过 Wind 单次100条上限，会自动按首字母分批拉取"
+    )
+
     # 技术指标物化任务配置
     TECHNICAL_INDICATORS_MATERIALIZATION_ENABLED: bool = Field(default=True, description="启用技术指标物化任务")
     TECHNICAL_INDICATORS_MATERIALIZATION_CRON: str = Field(default="20 18 * * 1-5", description="技术指标物化CRON表达式（默认交易日18:20）")

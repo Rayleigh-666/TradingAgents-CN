@@ -56,9 +56,9 @@ from app.worker.baostock_sync_service import (
 )
 from app.worker.etf_sync_service import run_etf_sync
 from app.worker.favorites_sync_task import run_favorites_data_sync
-# 港股和美股改为按需获取+缓存模式，不再需要定时同步任务
-# from app.worker.hk_sync_service import ...
-# from app.worker.us_sync_service import ...
+# 港股/美股：上游 v3.0 曾改为「按需获取+缓存」，但港美股无 MongoDB 缓存导致
+# 每次分析都实时打外部 API、数据检验必然失败。此处新增预热同步任务补齐缓存。
+from app.worker.hk_us_preheat_service import run_hk_preheat, run_us_preheat
 from app.middleware.operation_log_middleware import OperationLogMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -855,6 +855,48 @@ async def lifespan(app: FastAPI):
             logger.info(f"⏸️ 股票关注列表A股数据同步已添加但暂停: {settings.FAVORITES_DATA_SYNC_CRON}")
         else:
             logger.info(f"⭐ 股票关注列表A股数据同步已配置: {settings.FAVORITES_DATA_SYNC_CRON} (历史数据+财务数据)")
+
+        # 港股/美股行情预热缓存同步任务
+        # 标的池 = 指数成分股 ∪ 自选股；主备双源（默认 Yahoo 主 / Wind 备）
+        logger.info("🔄 配置港股/美股行情预热缓存任务...")
+
+        async def run_hk_preheat_job():
+            try:
+                logger.info("🇭🇰 开始港股预热同步...")
+                r = await run_hk_preheat()
+                logger.info(f"✅ 港股预热完成: {r}")
+            except Exception as e:
+                logger.error(f"❌ 港股预热失败: {e}", exc_info=True)
+
+        async def run_us_preheat_job():
+            try:
+                logger.info("🇺🇸 开始美股预热同步...")
+                r = await run_us_preheat()
+                logger.info(f"✅ 美股预热完成: {r}")
+            except Exception as e:
+                logger.error(f"❌ 美股预热失败: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_hk_preheat_job,
+            CronTrigger.from_crontab(settings.HK_PREHEAT_CRON, timezone=settings.TIMEZONE),
+            id="hk_preheat_sync",
+            name="港股行情预热缓存（指数成分∪自选股）"
+        )
+        scheduler.add_job(
+            run_us_preheat_job,
+            CronTrigger.from_crontab(settings.US_PREHEAT_CRON, timezone=settings.TIMEZONE),
+            id="us_preheat_sync",
+            name="美股行情预热缓存（指数成分∪自选股）"
+        )
+        if not settings.HK_US_PREHEAT_ENABLED:
+            scheduler.pause_job("hk_preheat_sync")
+            scheduler.pause_job("us_preheat_sync")
+            logger.info(f"⏸️ 港美股预热已添加但暂停: HK {settings.HK_PREHEAT_CRON} / US {settings.US_PREHEAT_CRON}")
+        else:
+            logger.info(
+                f"⭐ 港美股预热已配置: HK {settings.HK_PREHEAT_CRON} / US {settings.US_PREHEAT_CRON} "
+                f"(主源 {settings.HK_US_PREHEAT_PRIMARY_SOURCE})"
+            )
 
         # 新闻数据同步任务配置（使用AKShare同步所有股票新闻）
         logger.info("🔄 配置新闻数据同步任务...")

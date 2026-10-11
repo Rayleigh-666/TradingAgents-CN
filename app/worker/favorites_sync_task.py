@@ -31,35 +31,48 @@ def _get_sync_data_sources(enabled_sources: List[str]) -> List[str]:
 async def get_all_favorite_a_stocks() -> List[str]:
     """
     获取所有用户股票关注列表中的A股股票代码列表
-    
+
+    数据来源（双读，兼容新旧结构）：
+    - 新：`users` 集合的 `favorite_stocks` 内嵌数组（favorites_service.add_favorite:378 当前写入路径）
+    - 旧：`user_favorites` 集合的 `favorites` 数组（历史数据，已废弃）
+
+    ⚠️ 历史 bug：本函数曾**只**读 `user_favorites`，而自选股早已改写到
+    `users.favorite_stocks`，导致前端新增的自选股长期同步不到。现已修正为双读。
+
     Returns:
         A股股票代码列表（去重）
     """
     db = get_mongo_db()
-    
+
+    _A_MARKETS = ("A股", "cn", "CN", "china")
+
+    def _collect(favs, out: Set[str]) -> None:
+        for favorite in favs or []:
+            market = str(favorite.get("market") or "A股").strip()
+            if market in _A_MARKETS:
+                stock_code = favorite.get("stock_code")
+                if stock_code:
+                    out.add(str(stock_code).zfill(6))   # A 股统一 6 位
+
     try:
-        # 从 user_favorites 集合中获取所有用户的股票关注列表
-        cursor = db.user_favorites.find({}, {"favorites": 1})
-        
         a_stock_codes: Set[str] = set()
-        
-        async for doc in cursor:
-            favorites = doc.get("favorites", [])
-            for favorite in favorites:
-                # 只获取A股股票
-                market = favorite.get("market", "A股")
-                if market == "A股":
-                    stock_code = favorite.get("stock_code")
-                    if stock_code:
-                        # 确保股票代码是6位数字格式
-                        stock_code = str(stock_code).zfill(6)
-                        a_stock_codes.add(stock_code)
-        
-        codes_list = sorted(list(a_stock_codes))
+
+        # 1) 新结构：users.favorite_stocks（当前真实写入位置）
+        async for user in db.users.find({}, {"favorite_stocks": 1}):
+            _collect(user.get("favorite_stocks"), a_stock_codes)
+
+        # 2) 旧结构兼容：user_favorites 集合
+        try:
+            async for doc in db.user_favorites.find({}, {"favorites": 1}):
+                _collect(doc.get("favorites"), a_stock_codes)
+        except Exception as e:
+            logger.debug(f"读取旧 user_favorites 集合失败（可忽略）: {e}")
+
+        codes_list = sorted(a_stock_codes)
         logger.info(f"📊 获取到 {len(codes_list)} 只A股股票关注列表需要同步")
-        
+
         return codes_list
-        
+
     except Exception as e:
         logger.error(f"❌ 获取股票关注列表A股列表失败: {e}")
         return []
