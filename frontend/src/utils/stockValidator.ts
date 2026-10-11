@@ -133,7 +133,7 @@ export function validateHKStock(code: string): StockValidationResult {
  */
 export function validateStockCode(
   code: string,
-  marketHint?: 'A股' | 'ETF'
+  marketHint?: 'A股' | '美股' | '港股' | 'ETF'
 ): StockValidationResult {
   if (!code || !code.trim()) {
     return {
@@ -151,31 +151,42 @@ export function validateStockCode(
         return validateAStock(trimmedCode)
       case 'ETF':
         return validateETF(trimmedCode)
+      case '美股':
+        return validateUSStock(trimmedCode)
+      case '港股':
+        return validateHKStock(trimmedCode)
     }
   }
   
-  // 自动识别：先判断是否全是数字
-  const isNumeric = /^\d+$/.test(trimmedCode.replace(/[^0-9]/g, ''))
+  // 自动识别：含字母的按美股处理（AAPL、BRK.B）
+  if (/[A-Za-z]/.test(trimmedCode)) {
+    return validateUSStock(trimmedCode)
+  }
   
-  if (isNumeric) {
-    const cleanCode = trimmedCode.replace(/[^0-9]/g, '')
-    
-    // 6位数字 -> 先判断 ETF（50/51/52/15/16），否则 A股
-    if (cleanCode.length === 6) {
-      const etfResult = validateETF(cleanCode)
-      if (etfResult.valid) return etfResult
-      return validateAStock(cleanCode)
-    }
-    
+  const cleanCode = trimmedCode.replace(/[^0-9]/g, '')
+  
+  if (!cleanCode) {
     return {
       valid: false,
-      message: '数字代码长度不正确（A股必须是6位数字）'
+      message: '无法识别的股票代码格式'
     }
+  }
+  
+  // 6位数字 -> 先判断 ETF（50/51/52/15/16），否则 A股
+  if (cleanCode.length === 6) {
+    const etfResult = validateETF(cleanCode)
+    if (etfResult.valid) return etfResult
+    return validateAStock(cleanCode)
+  }
+  
+  // 1-5位数字 -> 港股（00700 腾讯、09988 阿里，也接受 700、9988）
+  if (cleanCode.length <= 5) {
+    return validateHKStock(cleanCode)
   }
   
   return {
     valid: false,
-    message: '无法识别的股票代码格式'
+    message: '数字代码长度不正确（A股/ETF 为6位，港股为1-5位）'
   }
 }
 
@@ -220,7 +231,7 @@ export function getStockCodeExamples(market: 'A股' | '美股' | '港股' | 'ETF
  * @param code 原始代码
  * @param market 市场类型
  */
-export function formatStockCode(code: string, market: 'A股' | 'ETF'): string {
+export function formatStockCode(code: string, market: 'A股' | '美股' | '港股' | 'ETF'): string {
   const validation = validateStockCode(code, market)
   return validation.normalizedCode || code
 }

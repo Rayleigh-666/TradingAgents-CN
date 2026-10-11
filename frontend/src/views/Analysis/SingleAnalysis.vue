@@ -92,6 +92,14 @@
                           <span>📈 ETF 基金</span>
                           <span style="color: #909399; font-size: 12px; margin-left: 8px;">（510050、159919 等）</span>
                         </el-option>
+                        <el-option label="🇭🇰 港股市场" value="港股">
+                          <span>🇭🇰 港股市场</span>
+                          <span style="color: #909399; font-size: 12px; margin-left: 8px;">（00700、09988）</span>
+                        </el-option>
+                        <el-option label="🇺🇸 美股市场" value="美股">
+                          <span>🇺🇸 美股市场</span>
+                          <span style="color: #909399; font-size: 12px; margin-left: 8px;">（AAPL、TSLA）</span>
+                        </el-option>
                       </el-select>
                     </el-form-item>
                   </el-col>
@@ -866,7 +874,7 @@ marked.setOptions({
 })
 
 // 市场类型定义
-type MarketType = 'A股' | 'ETF'
+type MarketType = 'A股' | 'ETF' | '港股' | '美股'
 
 // 分析引擎类型
 type AnalysisEngineType = 'legacy' | 'v2'
@@ -1190,6 +1198,32 @@ const validateStockCodeInput = () => {
         return
       }
     }
+
+    // 🔥 智能切换：当前市场校验失败、但代码符合港股/美股格式时自动切换市场
+    if (analysisForm.market === 'A股' || analysisForm.market === 'ETF') {
+      const hkCheck = validateStockCode(code, '港股')
+      if (hkCheck.valid) {
+        analysisForm.market = '港股'
+        analysisForm.stockCode = hkCheck.normalizedCode || code
+        stockCodeError.value = ''
+        stockCodeHelp.value = `✓ ${hkCheck.market}代码格式正确`
+        onMarketChange()
+        ElMessage.success('已自动识别为港股')
+        return
+      }
+
+      const usCheck = validateStockCode(code, '美股')
+      if (usCheck.valid) {
+        analysisForm.market = '美股'
+        analysisForm.stockCode = usCheck.normalizedCode || code
+        stockCodeError.value = ''
+        stockCodeHelp.value = `✓ ${usCheck.market}代码格式正确`
+        onMarketChange()
+        ElMessage.success('已自动识别为美股')
+        return
+      }
+    }
+
     stockCodeError.value = validation.message || '股票代码格式不正确'
     stockCodeHelp.value = ''
   } else {
@@ -1197,9 +1231,8 @@ const validateStockCodeInput = () => {
     stockCodeHelp.value = `✓ ${validation.market}代码格式正确`
 
     // 自动更新市场类型（如果识别出的市场与当前选择不同）
-    // V3.0 聚焦 A 股，港美股已暂停
     if (validation.market && validation.market !== analysisForm.market) {
-      const validMarkets: MarketType[] = ['A股', 'ETF']
+      const validMarkets: MarketType[] = ['A股', 'ETF', '港股', '美股']
       if ((validMarkets as string[]).includes(validation.market)) {
         analysisForm.market = validation.market as MarketType
         onMarketChange()  // 同步更新分析师选择（如 ETF 固定分析师）
@@ -1275,7 +1308,9 @@ const handleValidateData = async () => {
   // 确定市场类型（用于API调用）
   const marketTypeMap: Record<string, string> = {
     'A股': 'cn',
-    'ETF': 'cn'  // ETF 为 A 股场内基金
+    'ETF': 'cn',  // ETF 为 A 股场内基金
+    '港股': 'hk',
+    '美股': 'us'
   }
   const marketType = marketTypeMap[analysisForm.market] || 'cn'
 
