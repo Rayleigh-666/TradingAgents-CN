@@ -299,7 +299,20 @@ class Settings(BaseSettings):
         default=True, description="预热时同步港美股基础信息"
     )
     HK_US_PREHEAT_BATCH_SLEEP_SECONDS: float = Field(
-        default=0.15, ge=0, le=5, description="批量同步时每只标的之间的间隔（秒），用于限流保护"
+        default=0.15, ge=0, le=5, description="批量同步时每个批次之间的间隔（秒），用于限流保护"
+    )
+    HK_US_PREHEAT_BATCH_SIZE: int = Field(
+        default=60, ge=1, le=200,
+        description="Yahoo 批量下载每批标的数（yf.download 单次请求的 ticker 数）；调小可降低被限流风险"
+    )
+    HK_US_PREHEAT_USE_BATCH: bool = Field(
+        default=True,
+        description="日线预热是否使用 yfinance.download 批量下载（主源为 yahoo 时生效，可回退逐只模式）"
+    )
+    HK_US_PREHEAT_WIND_BATCH_SIZE: int = Field(
+        default=40, ge=1, le=100,
+        description="Wind 基础信息/财务单次查询携带的代码数量（实测多代码单次查询可行，"
+                    "40 只约 2.5s，远快于逐只 1.3s/只）"
     )
     HK_US_PREHEAT_UNIVERSE_REFRESH_DAYS: int = Field(
         default=7, ge=1, le=90, description="指数成分清单的最大缓存天数，超过则重新反查"

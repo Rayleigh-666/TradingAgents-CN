@@ -18,11 +18,33 @@ K 线接口 `app/routers/stocks.py:963-985` 在 `_detect_market_and_code` 之后
 
 关键约束（实测）
 ----------------
-- Wind `search_stocks` 单次最多返回 100 条，标普500(503)/港股通(500+) 会被截断
+- Wind `search_stocks` 单次最多返回 100 条，标普500(502)/港股通(667) 会被截断
   → 采用「达上限即细分」的递归分批策略（美股按 A-Z，港股按 0-9）
 - 美股后缀有两种：`.O`(纳斯达克) / `.N`(纽交所)，必须使用 Wind 返回值，不可自拼
 - Wind 传无后缀 `AAPL` 返回空，必须带后缀
+- 港股 Wind 代码为 **4 位**（`0002.HK`），与 Yahoo 格式一致；内部 symbol 为 5 位（`00002`）
 - 自选股存储在 `users.favorite_stocks` 内嵌数组（字段含 `market`），非独立集合
+- ⚠️ Wind 代码解析器会把**已退市**实体模糊匹配回来（`AMZN.O`→`AMAZ.OO`、
+  `COR.N`→`COR!.N`、`DD.N`→`DD!.N`、`FOXA.O`→`TFCFA.O`），
+  `!` 是 Wind 的退市标记。标普500 中 COR/DD/DOW/FOX 等「代码被复用」的标的最易中招。
+  故所有 Wind 返回都必须过 `windcode_matches()` 校验，不匹配一律弃用；
+  基础信息另加「证券简称含『退市』」判定（实测 AVB 在市却被 Wind 标为退市），
+  命中即转 Yahoo 兜底；财务则计入失败清单，宁缺勿错。
+
+吞吐优化（本期）
+----------------
+标的约 1190 只（HK 673 / US 517），逐只串行需 1.5–2 小时，故两处批量化：
+
+1. **日线**：`yfinance.download()` 一次请求多只（`HK_US_PREHEAT_BATCH_SIZE`，默认 60），
+   HTTP 次数从 N 降到 N/批大小；随后仍逐只按「> 库内最新 trade_date」过滤，
+   保证增量语义与幂等性不变。主源非 yahoo 或关闭开关时自动回退逐只。
+2. **基础信息 / 财务**：Wind `get_stock_basicinfo` / `get_stock_fundamentals`
+   支持一次传多个代码（`HK_US_PREHEAT_WIND_BATCH_SIZE`，默认 40，实测 20 只约 2.5s，
+   而逐只 1.3s/只），批内未覆盖的代码再逐只兜底重试。
+
+**`--force-full`**：忽略增量窗口，按完整 lookback 重取全历史，并从本批第一根 K 线
+重置 `pre_close/change/pct_chg` 起算点（`from_scratch`）。用于修正「首次只跑了短窗口
+（如 Gate-1 的 30/90 天）导致历史深度不足」的标的；仍是幂等 upsert，不会产生重复数据。
 
 设计文档：docs/design/hk-us-preheat-cache.md
 """
@@ -31,7 +53,7 @@ import argparse
 import asyncio
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pymongo import UpdateOne
@@ -58,11 +80,20 @@ INDEX_DEFS: Dict[str, Dict[str, str]] = {
 _SEARCH_PAGE_LIMIT = 100
 # 最大细分深度，防止极端情况下无限递归
 _MAX_SPLIT_DEPTH = 3
+# Yahoo 返回行数低于该值即视为「上游数据缺口」，尝试用 Wind 补齐。
+# 实测 AVB 在 Yahoo 侧整段只剩 1 根，而 Wind 有 222 根。
+_MIN_YAHOO_ROWS = 5
 
 _US_CHARS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _HK_CHARS = list("0123456789")
 
 UNIVERSE_COLLECTION = "hk_us_preheat_universe"
+
+# Wind 用于标记「已退市/已失效」证券的后缀字符
+_DELISTED_MARK = "!"
+# Wind 证券简称中的退市标记（如「艾芙隆海湾社区(AVALONBAY)(退市)」）。
+# 本项目的标的池来自指数成分与自选股，均为在市证券；命中该标记说明 Wind 侧数据陈旧。
+_DELISTED_NAME_MARK = "退市"
 
 # 自选股 market 字段值 → 内部市场标识
 _FAVORITE_MARKET_MAP = {
@@ -127,6 +158,48 @@ def _to_float(value: Any) -> Optional[float]:
         return f if f == f else None
     except (TypeError, ValueError):
         return None
+
+
+def windcode_matches(queried: str, returned: str) -> bool:
+    """
+    校验 Wind 返回的代码是否确为所查询的标的（防止把「另一家公司」的数据写进来）。
+
+    实测 Wind 自然语言解析器会把**已退市/已失效**的代码模糊匹配回来：
+        AMZN.O → AMAZ.OO  （AMAZING ENE OIL & GAS，前缀相似误配）
+        COR.N  → COR!.N   （`!` 是 Wind 的退市标记；DD.N→DD!.N、DOW.N→DOW!.N 同理）
+        FOXA.O → TFCFA.O  （21世纪福克斯-A，退市）
+    标普500 成分清单里有若干「代码被复用」的标的（COR/DD/DOW/FOX…），
+    不校验就会把退市旧实体的财务/基础信息写到当前 symbol 名下。
+
+    returned 为空（未返回代码列）时不阻断，交由调用方决定。
+    """
+    if not returned:
+        return True
+    q = (queried or "").strip().upper()
+    r = (returned or "").strip().upper()
+    if not q:
+        return True
+    if _DELISTED_MARK in r:
+        return False
+    if q == r:
+        return True
+    q_base, _, _ = q.partition(".")
+    r_base, _, _ = r.partition(".")
+    if q_base == r_base:
+        return True                       # 同一标的，交易所后缀可能不同（.O / .N）
+    if q_base.isdigit() and r_base.isdigit() and q_base.lstrip("0") == r_base.lstrip("0"):
+        return True                       # 港股前导零差异：0002 vs 00002
+    return False
+
+
+def match_requested(requested: Sequence[str], returned: str) -> Optional[str]:
+    """在 requested 里找出与 returned 匹配的那个代码；无匹配返回 None"""
+    if not returned:
+        return None
+    for wc in requested:
+        if windcode_matches(wc, returned):
+            return wc
+    return None
 
 
 # ==================== 主服务 ====================
@@ -357,9 +430,20 @@ class HKUSPreheatService:
     async def sync_daily(self, symbols: Optional[List[str]] = None,
                          lookback_days: Optional[int] = None,
                          market: Optional[str] = None,
-                         progress_every: int = 50) -> Dict[str, Any]:
+                         progress_every: int = 50,
+                         force_full: bool = False) -> Dict[str, Any]:
         """
         同步港美股日线。symbols 为空则处理 universe 中全部（可按 market 过滤 HK/US）。
+
+        两条路径：
+        - **批量**（默认）：主源为 yahoo 且 `HK_US_PREHEAT_USE_BATCH=True` 时，
+          用 `yfinance.download()` 一次请求拉多只，HTTP 次数从 N 降到 N/批大小，
+          全量 ~1100 只从 1 小时级压到 10 分钟级。逐只增量窗口过滤保证幂等与正确性。
+        - **逐只**：主源为 wind 或显式关闭批量时，退化为逐只取数（原实现）。
+
+        force_full=True 时忽略增量窗口，按完整 lookback 重取并重算
+        `pre_close/change/pct_chg`（修正历史深度不足的标的）。与增量模式一样是
+        幂等 upsert，不会产生重复数据。
 
         返回统计：{total, ok, skipped, failed, rows, failed_symbols, elapsed}
         """
@@ -367,6 +451,19 @@ class HKUSPreheatService:
         lookback = int(lookback_days or settings.HK_US_PREHEAT_LOOKBACK_DAYS or 365)
         targets = await self._load_targets(symbols, market)
 
+        primary = (settings.HK_US_PREHEAT_PRIMARY_SOURCE or "yahoo").strip().lower()
+        use_batch = bool(settings.HK_US_PREHEAT_USE_BATCH) and primary == "yahoo"
+        if use_batch and targets:
+            return await self._sync_daily_batch(targets, lookback, force_full)
+        return await self._sync_daily_per_symbol(
+            targets, lookback, progress_every, force_full)
+
+    # ---------- 路径 A：逐只（wind 主源 / 批量关闭） ----------
+
+    async def _sync_daily_per_symbol(self, targets: List[Dict[str, str]],
+                                     lookback: int, progress_every: int = 50,
+                                     force_full: bool = False) -> Dict[str, Any]:
+        db = get_mongo_db()
         stats: Dict[str, Any] = {
             "total": len(targets), "ok": 0, "skipped": 0,
             "failed": 0, "rows": 0, "failed_symbols": [],
@@ -378,7 +475,8 @@ class HKUSPreheatService:
             market, symbol = t["market"], t["symbol"]
             coll = db[_coll_names(market)["daily"]]
             try:
-                limit = await self._incremental_limit(coll, symbol, lookback)
+                limit = lookback if force_full else \
+                    await self._incremental_limit(coll, symbol, lookback)
                 if limit <= 0:
                     stats["skipped"] += 1
                     continue
@@ -388,7 +486,8 @@ class HKUSPreheatService:
                     stats["failed"] += 1
                     stats["failed_symbols"].append(f"{market}:{symbol}")
                     continue
-                n = await self._upsert_daily(coll, items, t, source)
+                n = await self._upsert_daily(coll, items, t, source,
+                                             from_scratch=force_full)
                 stats["rows"] += n
                 stats["ok"] += 1
             except Exception as e:
@@ -404,6 +503,220 @@ class HKUSPreheatService:
         stats["elapsed"] = round((datetime.now() - started).total_seconds(), 1)
         logger.info(f"✅ 日线同步完成: {stats}")
         return stats
+
+    # ---------- 路径 B：Yahoo 批量下载（默认） ----------
+
+    async def _sync_daily_batch(self, targets: List[Dict[str, str]],
+                                lookback: int,
+                                force_full: bool = False) -> Dict[str, Any]:
+        """
+        批量日线同步：先逐只算增量窗口 → 按市场汇总统一时间窗 → 分批 yf.download
+        → 逐只按「> 库内最新 trade_date」过滤后再幂等 upsert。
+
+        force_full=True 时跳过「> 最新交易日」过滤并按完整窗口重算涨跌（重建历史深度）。
+        Yahoo 无数据的标的自动回退 Wind 单只；仍无数据才计入失败清单。
+        """
+        db = get_mongo_db()
+        stats: Dict[str, Any] = {
+            "total": len(targets), "ok": 0, "skipped": 0, "failed": 0,
+            "rows": 0, "failed_symbols": [], "source": {"yahoo": 0, "wind": 0},
+        }
+        if force_full:
+            stats["mode"] = "force_full"
+        started = datetime.now()
+
+        # 1. 逐只算增量窗口（一次 find_one / 只，可忽略）
+        plan: List[Dict[str, Any]] = []
+        for t in targets:
+            coll = db[_coll_names(t["market"])["daily"]]
+            last = await self._last_trade_date(coll, t["symbol"])
+            limit = lookback if force_full else self._window_from_last(last, lookback)
+            if limit <= 0:
+                stats["skipped"] += 1
+                continue
+            plan.append({"t": t, "coll": coll, "last": last, "limit": limit})
+
+        if not plan:
+            stats["elapsed"] = round((datetime.now() - started).total_seconds(), 1)
+            logger.info(f"✅ 日线同步完成（无需更新）: {stats}")
+            return stats
+
+        chunk_size = int(settings.HK_US_PREHEAT_BATCH_SIZE or 60)
+        sleep_s = float(settings.HK_US_PREHEAT_BATCH_SLEEP_SECONDS or 0)
+
+        # 2. 按市场分批下载
+        for mk in ("HK", "US"):
+            group = [p for p in plan if p["t"]["market"] == mk]
+            if not group:
+                continue
+
+            # 统一时间窗 = 覆盖本组最早需要的起点（后续逐只再裁）
+            end_day = date.today() + timedelta(days=1)
+            start_day = min(end_day - timedelta(days=p["limit"] + 10) for p in group)
+
+            tickers: List[str] = []
+            for p in group:
+                tk = p["t"].get("yahoocode") or ""
+                if tk and tk not in tickers:
+                    tickers.append(tk)
+
+            logger.info(f"  ⬇️ [{mk}] Yahoo 批量下载 {len(tickers)} 只"
+                        f"（{start_day} ~ {end_day}，{chunk_size} 只/批，共 "
+                        f"{-(-len(tickers)//chunk_size)} 批）…")
+            data_map = await asyncio.to_thread(
+                self._yahoo_batch, tickers, start_day, end_day, chunk_size, sleep_s)
+            logger.info(f"  ✅ [{mk}] Yahoo 有数据 {len(data_map)}/{len(tickers)} 只，开始写库…")
+
+            # 3. 逐只过滤 + 写库
+            for i, p in enumerate(group, 1):
+                t, coll, last = p["t"], p["coll"], p["last"]
+                symbol = t["symbol"]
+                try:
+                    raw = data_map.get(t.get("yahoocode") or "") or []
+                    rows_written = 0
+                    used: Optional[str] = None
+
+                    # (a) Yahoo 覆盖过薄（上游缺口）→ 试用 Wind 补齐，谁多听谁。
+                    #     按**完整 lookback** 取 Wind（而非增量小窗口），否则补不全；
+                    #     且只在「Wind 行数 > Yahoo 行数 且 > 库内现有行数」时切换，
+                    #     保证任何情况下都不会让已存历史变短。
+                    if len(raw) < _MIN_YAHOO_ROWS:
+                        existing = await coll.count_documents({"symbol": symbol})
+                        w_items = await asyncio.to_thread(
+                            self._wind_kline, t["windcode"], max(p["limit"], lookback))
+                        if w_items and len(w_items) > max(len(raw), existing):
+                            rows_written = await self._write_single_source(
+                                coll, t, w_items, "wind", from_scratch=True)
+                            used = "wind"
+
+                    if used is None:
+                        new_rows = raw if force_full else \
+                            [it for it in raw if not last or (it.get("date") or "") > last]
+                        if new_rows:
+                            rows_written = await self._upsert_daily(
+                                coll, new_rows, t, "yahoo", from_scratch=force_full)
+                            used = "yahoo"
+                        elif raw:
+                            # Yahoo 有历史数据但无新增（已是库内最新）
+                            stats["skipped"] += 1
+                        else:
+                            # (b) Yahoo 完全没数据 → Wind 单只兜底
+                            w_items = await asyncio.to_thread(
+                                self._wind_kline, t["windcode"], p["limit"])
+                            if w_items and last and not force_full:
+                                w_items = [it for it in w_items
+                                           if (it.get("date") or "") > last]
+                            if w_items:
+                                rows_written = await self._write_single_source(
+                                    coll, t, w_items, "wind", from_scratch=force_full)
+                                used = "wind"
+                            elif last and not force_full:
+                                stats["skipped"] += 1
+                            else:
+                                stats["failed"] += 1
+                                stats["failed_symbols"].append(f"{mk}:{symbol}")
+
+                    if used:
+                        stats["rows"] += rows_written
+                        stats["ok"] += 1
+                        stats["source"][used] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    stats["failed_symbols"].append(f"{mk}:{symbol}")
+                    logger.warning(f"⚠️ 日线入库失败 {mk}:{symbol}: {e}")
+
+                if i % 100 == 0:
+                    logger.info(f"  …[{mk}] 已写 {i}/{len(group)}"
+                                f"（ok{stats['ok']} skip{stats['skipped']} fail{stats['failed']}）")
+
+        stats["elapsed"] = round((datetime.now() - started).total_seconds(), 1)
+        logger.info(f"✅ 日线同步完成（批量）: {stats}")
+        return stats
+
+    def _yahoo_batch(self, tickers: List[str], start_day: date, end_day: date,
+                     chunk_size: int, sleep_s: float) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        分批调用 yf.download，返回 {ticker: [日线 item, ...]}。
+
+        单批内的 ticker 由 yfinance 自行并发（threads=True），
+        任一只无数据/退市不会影响同批其它标的。
+        """
+        import time as _time
+        import yfinance as yf
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        s = start_day.strftime("%Y-%m-%d")
+        e = end_day.strftime("%Y-%m-%d")
+        chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+
+        for idx, chunk in enumerate(chunks, 1):
+            try:
+                df = yf.download(
+                    chunk, start=s, end=e, auto_adjust=False,
+                    group_by="ticker", threads=True, progress=False, timeout=30)
+            except Exception as ex:
+                logger.warning(f"⚠️ Yahoo 批量下载第 {idx}/{len(chunks)} 批失败"
+                               f"（{len(chunk)} 只，将逐只回退）: {ex}")
+                df = None
+
+            if df is not None and not df.empty:
+                try:
+                    is_multi = getattr(df.columns, "nlevels", 1) > 1
+                    if is_multi:
+                        level0 = set(df.columns.get_level_values(0))
+                        for tk in chunk:
+                            if tk not in level0:
+                                continue
+                            rows = self._yahoo_frame_to_items(df[tk])
+                            if rows:
+                                out[tk] = rows
+                    elif len(chunk) == 1:
+                        rows = self._yahoo_frame_to_items(df)
+                        if rows:
+                            out[chunk[0]] = rows
+                except Exception as ex:
+                    logger.warning(f"⚠️ Yahoo 批量结果解析失败（第 {idx} 批）: {ex}")
+
+            if sleep_s:
+                _time.sleep(sleep_s)
+            if idx % 5 == 0 or idx == len(chunks):
+                logger.info(f"  …Yahoo 下载进度 {idx}/{len(chunks)} 批，累计有数据 "
+                            f"{len(out)}/{len(tickers)} 只")
+
+        return out
+
+    @staticmethod
+    def _yahoo_frame_to_items(frame: Any) -> List[Dict[str, Any]]:
+        """单只标的的 yfinance DataFrame → 日线 item 列表（与 `_yahoo_kline` 同构）"""
+        if frame is None or getattr(frame, "empty", True):
+            return []
+        try:
+            # 单只下载时可能多一层 ticker 索引，拍平到字段层
+            if hasattr(frame.columns, "nlevels") and frame.columns.nlevels > 1:
+                frame = frame.droplevel(0, axis=1)
+            if "Close" not in frame.columns:
+                return []
+        except Exception:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for idx, row in frame.iterrows():
+            try:
+                d = idx.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            close = _to_float(row.get("Close"))
+            if close is None:
+                continue  # 停牌 / 无成交行
+            out.append({
+                "date": d,
+                "open": _to_float(row.get("Open")),
+                "high": _to_float(row.get("High")),
+                "low": _to_float(row.get("Low")),
+                "close": close,
+                "volume": _to_float(row.get("Volume")),
+            })
+        return out
 
     async def _load_targets(self, symbols: Optional[List[str]],
                             market: Optional[str] = None) -> List[Dict[str, str]]:
@@ -425,22 +738,39 @@ class HKUSPreheatService:
                 })
         return out
 
-    async def _incremental_limit(self, coll, symbol: str, default_lookback: int) -> int:
+    async def _last_trade_date(self, coll, symbol: str) -> Optional[str]:
+        """库内该 symbol 的最新交易日（"YYYY-MM-DD"），无数据返回 None"""
+        doc = await coll.find_one({"symbol": symbol}, {"trade_date": 1},
+                                  sort=[("trade_date", -1)])
+        if doc and doc.get("trade_date"):
+            return str(doc["trade_date"])[:10]
+        return None
+
+    @staticmethod
+    def _window_from_last(last: Optional[str], default_lookback: int) -> int:
         """
-        计算本次需要拉取的自然日窗口。
-        返回 0 表示已是最新，无需更新。
+        由「库内最新交易日」推出本次需拉取的自然日窗口。
+        返回 0 表示已是最新（当天或未来），无需更新。
         """
-        doc = await coll.find_one({"symbol": symbol}, {"trade_date": 1}, sort=[("trade_date", -1)])
-        if not doc or not doc.get("trade_date"):
+        if not last:
             return default_lookback
         try:
-            latest = datetime.strptime(str(doc["trade_date"])[:10], "%Y-%m-%d").date()
+            latest = datetime.strptime(str(last)[:10], "%Y-%m-%d").date()
         except ValueError:
             return default_lookback
         gap = (date.today() - latest).days
         if gap <= 0:
             return 0
+        # 多留 5 天缓冲，避免因停牌/假期导致漏掉最新交易日
         return min(max(gap + 5, 5), default_lookback)
+
+    async def _incremental_limit(self, coll, symbol: str, default_lookback: int) -> int:
+        """
+        计算本次需要拉取的自然日窗口。
+        返回 0 表示已是最新，无需更新。
+        """
+        last = await self._last_trade_date(coll, symbol)
+        return self._window_from_last(last, default_lookback)
 
     # ---------- 双源取数 ----------
 
@@ -517,22 +847,61 @@ class HKUSPreheatService:
         return out or None
 
     async def _upsert_daily(self, coll, items: List[Dict[str, Any]],
-                            target: Dict[str, str], source: str) -> int:
-        """幂等写入日线（唯一键 symbol+trade_date+data_source+period）"""
+                            target: Dict[str, str], source: str,
+                            from_scratch: bool = False) -> int:
+        """
+        幂等写入日线（唯一键 symbol+trade_date+data_source+period）。
+
+        from_scratch=True 时不读取库内最近收盘作为首日前收，而是从本批第一根 K 线
+        重新起算 pre_close/change/pct_chg（用于 force_full 重建完整历史）。
+        """
+        now = datetime.now()
+        prev_close = None
+        if not from_scratch:
+            last = await coll.find_one({"symbol": target["symbol"]}, {"close": 1},
+                                       sort=[("trade_date", -1)])
+            if last:
+                prev_close = _to_float(last.get("close"))
+        ops = self._build_daily_ops(items, target, source, prev_close, now)
+        if not ops:
+            return 0
+        res = await coll.bulk_write(ops, ordered=False)
+        return (res.upserted_count or 0) + (res.modified_count or 0)
+
+    async def _write_single_source(self, coll, target: Dict[str, str],
+                                   items: List[Dict[str, Any]], source: str,
+                                   from_scratch: bool = False) -> int:
+        """
+        把该 symbol 的日线整体切换为**单一来源**后写入。
+
+        唯一键含 data_source，若同一标的先后由 Yahoo / Wind 写入，同一交易日会出现
+        两条记录，K 线接口会返回重复日期。故切换来源时先清掉其它来源的旧行。
+        前收在删除前先取出，保证增量链式涨跌不被破坏。
+        """
+        now = datetime.now()
+        prev_close = None
+        if not from_scratch:
+            last = await coll.find_one({"symbol": target["symbol"]}, {"close": 1},
+                                       sort=[("trade_date", -1)])
+            if last:
+                prev_close = _to_float(last.get("close"))
+        await coll.delete_many({"symbol": target["symbol"],
+                                "data_source": {"$ne": source}})
+        ops = self._build_daily_ops(items, target, source, prev_close, now)
+        if not ops:
+            return 0
+        res = await coll.bulk_write(ops, ordered=False)
+        return (res.upserted_count or 0) + (res.modified_count or 0)
+
+    @staticmethod
+    def _build_daily_ops(items: List[Dict[str, Any]], target: Dict[str, str],
+                         source: str, prev_close: Optional[float],
+                         now: datetime) -> List[UpdateOne]:
+        """按日期升序链式计算 change/pct_chg 并生成 upsert 操作"""
         market, symbol = target["market"], target["symbol"]
         full_symbol = to_full_symbol(target["windcode"], market)
-        now = datetime.now()
-
-        # 按日期升序，用于计算 change / pct_chg
-        items = sorted(items, key=lambda x: x.get("date") or "")
-        # 取库中最近一条作为增量首日的前收
-        prev_close: Optional[float] = None
-        last = await coll.find_one({"symbol": symbol}, {"close": 1}, sort=[("trade_date", -1)])
-        if last:
-            prev_close = _to_float(last.get("close"))
-
-        ops = []
-        for it in items:
+        ops: List[UpdateOne] = []
+        for it in sorted(items, key=lambda x: x.get("date") or ""):
             close = _to_float(it.get("close"))
             if close is None:
                 continue
@@ -560,40 +929,45 @@ class HKUSPreheatService:
                 upsert=True,
             ))
             prev_close = close
-
-        if not ops:
-            return 0
-        res = await coll.bulk_write(ops, ordered=False)
-        return (res.upserted_count or 0) + (res.modified_count or 0)
+        return ops
 
     # ==================== 三、基础信息同步 ====================
 
     async def sync_basic_info(self, symbols: Optional[List[str]] = None,
                               market: Optional[str] = None) -> Dict[str, Any]:
         """
-        同步基础信息到 stock_basic_info_<hk|us>。
+        同步基础信息到 `stock_basic_info_<hk|us>`。
         数据检验读取字段：symbol / code / name / list_date。
+
+        批量策略：Wind `get_stock_basicinfo` 支持一次查询多个代码
+        （实测 20 只 2.5s，逐只 1.3s/只），故按 `WIND_BATCH_SIZE` 分批，
+        批内未覆盖的代码再逐只兜底重试。
         """
         db = get_mongo_db()
         targets = await self._load_targets(symbols, market)
-        stats = {"total": len(targets), "ok": 0, "failed": 0, "failed_symbols": []}
+        stats = {"total": len(targets), "ok": 0, "failed": 0,
+                 "failed_symbols": [], "batches": 0}
         now = datetime.now()
+        batch_size = int(settings.HK_US_PREHEAT_WIND_BATCH_SIZE or 40)
+
+        info_map = await self._collect_basic_info(targets, batch_size, stats)
+        await self._retry_missing_basic(targets, info_map, stats)
 
         for t in targets:
-            market, symbol = t["market"], t["symbol"]
-            coll = db[_coll_names(market)["basic"]]
+            market_, symbol = t["market"], t["symbol"]
+            coll = db[_coll_names(market_)["basic"]]
+            info = info_map.get(t["windcode"])
+            if not info:
+                stats["failed"] += 1
+                stats["failed_symbols"].append(f"{market_}:{symbol}")
+                continue
             try:
-                info = await asyncio.to_thread(self._fetch_basic_info, t)
-                if not info:
-                    stats["failed"] += 1
-                    stats["failed_symbols"].append(f"{market}:{symbol}")
-                    continue
                 await coll.update_one(
-                    {"market": market, "symbol": symbol},
+                    {"market": market_, "symbol": symbol},
                     {
                         "$set": {
-                            "code": symbol, "full_symbol": to_full_symbol(t["windcode"], market),
-                            "market": market, "name": info.get("name") or "",
+                            "code": symbol, "full_symbol": to_full_symbol(t["windcode"], market_),
+                            "market": market_, "name": info.get("name") or "",
                             "list_date": info.get("list_date") or "",
                             "industry": info.get("industry") or "",
                             "market_board": info.get("market_board") or "",
@@ -607,38 +981,101 @@ class HKUSPreheatService:
                 stats["ok"] += 1
             except Exception as e:
                 stats["failed"] += 1
-                stats["failed_symbols"].append(f"{market}:{symbol}")
-                logger.warning(f"⚠️ 基础信息同步失败 {market}:{symbol}: {e}")
+                stats["failed_symbols"].append(f"{market_}:{symbol}")
+                logger.warning(f"⚠️ 基础信息写入失败 {market_}:{symbol}: {e}")
 
         logger.info(f"✅ 基础信息同步完成: {stats}")
         return stats
 
-    def _fetch_basic_info(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """
-        基础信息：用 Wind（含上市板/行业，质量最高）。
-        实测返回列名示例：Wind代码 / 证券简称 / **首发上市日期** / 所属WIND行业明细 / 上市板
-        """
-        market, symbol = target["market"], target["symbol"]
+    async def _collect_basic_info(self, targets: List[Dict[str, str]],
+                                  batch_size: int, stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """按批拉取基础信息，返回 {windcode: info}"""
+        info_map: Dict[str, Dict[str, Any]] = {}
+        for chunk in self._chunks(targets, batch_size):
+            got = await asyncio.to_thread(
+                self._fetch_basic_batch, [t["windcode"] for t in chunk])
+            info_map.update(got)
+            stats["batches"] += 1
+            logger.info(f"  …基础信息批量 {stats['batches']} 批，累计命中 "
+                        f"{len(info_map)}/{len(targets)} 只")
+        return info_map
+
+    async def _retry_missing_basic(self, targets: List[Dict[str, str]],
+                                   info_map: Dict[str, Dict[str, Any]],
+                                   stats: Dict[str, Any]) -> None:
+        """批量未覆盖的代码逐只兜底重试"""
+        missing = [t for t in targets if t["windcode"] not in info_map]
+        if not missing:
+            return
+        if len(missing) > 50 and len(missing) > len(targets) * 0.5:
+            logger.warning(f"⚠️ 基础信息批量命中率偏低（缺 {len(missing)}/{len(targets)}），"
+                           f"判定 Wind 批量查询异常，逐只兜底重试…")
+        for t in missing:
+            info = await asyncio.to_thread(self._fetch_basic_info, t)
+            if not info:
+                # Wind 无有效命中（含代码误配到退市旧实体）→ Yahoo 兜底
+                info = await asyncio.to_thread(self._fetch_basic_info_yahoo, t)
+            if info:
+                info_map[t["windcode"]] = info
+
+    @staticmethod
+    def _chunks(items: List[Any], size: int) -> List[List[Any]]:
+        size = max(1, int(size or 1))
+        return [items[i:i + size] for i in range(0, len(items), size)]
+
+    def _fetch_basic_batch(self, windcodes: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Wind 一次查询多只基础信息 → {windcode: info}"""
+        if not windcodes:
+            return {}
+        q = "查询" + "、".join(windcodes) + "的证券简称、上市日期、所属Wind行业、上市板"
         try:
             df = self._wind_client().call_table(
-                "stock_data", "get_stock_basicinfo",
-                {"question": f"查询{target['windcode']}的证券简称、上市日期、所属Wind行业、上市板"})
+                "stock_data", "get_stock_basicinfo", {"question": q})
         except Exception as e:
-            logger.debug(f"Wind 基础信息失败 {symbol}: {e}")
-            return None
+            logger.warning(f"⚠️ Wind 基础信息批量查询失败（{len(windcodes)} 只）: {e}")
+            return {}
         if df is None or getattr(df, "empty", True):
-            return None
+            return {}
+        code_col = next((c for c in ("Wind代码", "代码", "windcode") if c in df.columns), None)
+        if not code_col:
+            logger.warning(f"⚠️ 基础信息批量结果无代码列: {list(df.columns)}")
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            ret = str(row.get(code_col) or "").strip()
+            if not ret or ret in ("None", "nan"):
+                continue
+            # 只接受确实命中「本批请求代码」的行，避免退市旧实体串号
+            wc = match_requested(windcodes, ret)
+            if not wc:
+                logger.info(f"⏭️ 基础信息跳过不匹配返回：请求批内无 {ret}")
+                continue
+            info = self._parse_basic_row(df, row)
+            if info:
+                out[wc] = info
+        return out
 
+    @staticmethod
+    def _parse_basic_row(df: Any, row: Any) -> Optional[Dict[str, Any]]:
+        """
+        DataFrame 某行 → 基础信息 dict。
+        实测返回列名：Wind代码 / 证券简称 / **首发上市日期** / 所属WIND行业明细 / 上市板
+        """
         def pick(*keys: str) -> str:
-            """按子串匹配列名（Wind 列名有「首发上市日期」这类前缀变体）"""
             for c in df.columns:
+                if "级别" in str(c):      # 跳过「所属WIND行业明细.行业级别」这类派生列
+                    continue
                 if any(k in str(c) for k in keys):
-                    v = str(df.iloc[0].get(c) or "").strip()
+                    v = str(row.get(c) or "").strip()
                     if v and v not in ("None", "nan"):
                         return v
             return ""
 
         name = pick("证券简称", "简称", "名称")
+        if _DELISTED_NAME_MARK in name:
+            # 标的池均为在市证券；命中退市标记说明 Wind 侧为陈旧数据（实测 AVB 中招），
+            # 返回 None 让调用方转 Yahoo 兜底。
+            return None
         list_date = pick("上市日期", "上市日")[:10]
         industry = pick("WIND行业", "行业")
         board = pick("上市板")
@@ -650,34 +1087,111 @@ class HKUSPreheatService:
             "source": "wind",
         }
 
+    def _fetch_basic_info(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """单只兜底：Wind 查询基础信息（含代码匹配校验）"""
+        try:
+            df = self._wind_client().call_table(
+                "stock_data", "get_stock_basicinfo",
+                {"question": f"查询{target['windcode']}的证券简称、上市日期、所属Wind行业、上市板"})
+        except Exception as e:
+            logger.debug(f"Wind 基础信息失败 {target['symbol']}: {e}")
+            return None
+        if df is None or getattr(df, "empty", True):
+            return None
+        code_col = next((c for c in ("Wind代码", "代码", "windcode") if c in df.columns), None)
+        if code_col is not None:
+            ret = str(df.iloc[0].get(code_col) or "").strip()
+            if not windcode_matches(target["windcode"], ret):
+                logger.info(f"⏭️ Wind 基础信息代码不匹配，弃用 {target['windcode']} ← {ret}")
+                return None
+        return self._parse_basic_row(df, df.iloc[0])
+
+    @staticmethod
+    def _fetch_basic_info_yahoo(target: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """
+        Yahoo 兜底基础信息。
+
+        用于 Wind 把代码误配到「已退市同名/相似标的」的场景：
+        标普500 里 COR(Cencora)/DD(DuPont)/DOW(Dow)/FOX(Fox Corp) 等
+        「代码被复用」的标的，Wind 会解析回退市旧实体，此时改用 Yahoo。
+        """
+        import yfinance as yf
+        tk = target.get("yahoocode") or target["windcode"]
+        try:
+            info = yf.Ticker(tk).info or {}
+        except Exception as e:
+            logger.debug(f"Yahoo 基础信息失败 {tk}: {e}")
+            return None
+
+        name = str(info.get("longName") or info.get("shortName") or "").strip()
+        list_date = ""
+        # yfinance 1.7.0 实际字段是 firstTradeDateMilliseconds（毫秒），
+        # 旧版本为 firstTradeDateEpochUtc（秒），两者都兼容。
+        ftd_ms = info.get("firstTradeDateMilliseconds")
+        ftd_s = info.get("firstTradeDateEpochUtc")
+        try:
+            if ftd_ms:
+                list_date = datetime.fromtimestamp(
+                    int(ftd_ms) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+            elif ftd_s:
+                list_date = datetime.fromtimestamp(
+                    int(ftd_s), tz=timezone.utc).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            list_date = ""
+        industry = str(info.get("industry") or info.get("sector") or "").strip()
+        board = str(info.get("exchange") or info.get("fullExchangeName") or "").strip()
+        if not (name or list_date):
+            return None
+        return {
+            "name": name, "list_date": list_date,
+            "industry": industry, "market_board": board,
+            "source": "yahoo",
+        }
+
     # ==================== 四、财务同步 ====================
 
     async def sync_financial(self, symbols: Optional[List[str]] = None,
                              market: Optional[str] = None) -> Dict[str, Any]:
-        """同步财务数据到 stock_financial_data_<hk|us>（Wind 自然语言查询）"""
+        """
+        同步财务数据到 `stock_financial_data_<hk|us>`（Wind 多代码批量查询）。
+
+        批量：`get_stock_fundamentals` 支持一次查询多只（实测 15 只 2.8s），
+        批内未覆盖的代码再逐只兜底。
+        """
         db = get_mongo_db()
         targets = await self._load_targets(symbols, market)
-        stats = {"total": len(targets), "ok": 0, "failed": 0, "failed_symbols": []}
+        stats = {"total": len(targets), "ok": 0, "failed": 0,
+                 "failed_symbols": [], "batches": 0}
         now = datetime.now()
+        batch_size = int(settings.HK_US_PREHEAT_WIND_BATCH_SIZE or 40)
+
+        rec_map = await self._collect_financial(targets, batch_size, stats)
+        missing = [t for t in targets if t["windcode"] not in rec_map]
+        for t in missing:
+            rec = await asyncio.to_thread(self._fetch_financial, t)
+            if rec:
+                rec_map[t["windcode"]] = rec
 
         for t in targets:
-            market, symbol = t["market"], t["symbol"]
-            coll = db[_coll_names(market)["financial"]]
+            market_, symbol = t["market"], t["symbol"]
+            coll = db[_coll_names(market_)["financial"]]
+            rec = rec_map.get(t["windcode"])
+            if not rec:
+                stats["failed"] += 1
+                stats["failed_symbols"].append(f"{market_}:{symbol}")
+                continue
             try:
-                rec = await asyncio.to_thread(self._fetch_financial, t)
-                if not rec:
-                    stats["failed"] += 1
-                    stats["failed_symbols"].append(f"{market}:{symbol}")
-                    continue
                 await coll.update_one(
-                    {"market": market, "symbol": symbol,
+                    {"market": market_, "symbol": symbol,
                      "report_period": rec["report_period"]},
                     {
                         "$set": {
-                            "code": symbol, "full_symbol": to_full_symbol(t["windcode"], market),
-                            "market": market, "data_source": "wind",
+                            "code": symbol, "full_symbol": to_full_symbol(t["windcode"], market_),
+                            "market": market_, "data_source": "wind",
                             "revenue": rec.get("revenue"), "net_profit": rec.get("net_profit"),
-                            "roe": rec.get("roe"), "updated_at": now,
+                            "roe": rec.get("roe"),
+                            "report_period_label": rec.get("report_period_label") or "",
+                            "updated_at": now,
                         },
                         "$setOnInsert": {"created_at": now, "version": 1},
                     },
@@ -686,36 +1200,70 @@ class HKUSPreheatService:
                 stats["ok"] += 1
             except Exception as e:
                 stats["failed"] += 1
-                stats["failed_symbols"].append(f"{market}:{symbol}")
-                logger.warning(f"⚠️ 财务同步失败 {market}:{symbol}: {e}")
+                stats["failed_symbols"].append(f"{market_}:{symbol}")
+                logger.warning(f"⚠️ 财务写入失败 {market_}:{symbol}: {e}")
 
         logger.info(f"✅ 财务同步完成: {stats}")
         return stats
 
-    def _fetch_financial(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """
-        Wind 财务查询 → 结构化字段。
+    async def _collect_financial(self, targets: List[Dict[str, str]],
+                                 batch_size: int, stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """按批拉取财务，返回 {windcode: rec}"""
+        rec_map: Dict[str, Dict[str, Any]] = {}
+        for chunk in self._chunks(targets, batch_size):
+            got = await asyncio.to_thread(
+                self._fetch_financial_batch, [t["windcode"] for t in chunk])
+            rec_map.update(got)
+            stats["batches"] += 1
+            logger.info(f"  …财务批量 {stats['batches']} 批，累计命中 "
+                        f"{len(rec_map)}/{len(targets)} 只")
+        return rec_map
 
-        实测 Wind 返回的是**结构化表格**而非自然语言，形如：
-            columns: [Wind代码, 证券简称, 最新营业收入(亿元), 最新净利润(亿元), 最新净资产收益率ROE(%)]
-            rows:    [["0700.HK","腾讯控股",4012.43,1141.15,9.9664]]
-        故用 call_table 解析，并把「亿元」换算为「元」以对齐 A 股集合口径。
-        """
-        wc = target["windcode"]
+    def _fetch_financial_batch(self, windcodes: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Wind 一次查询多只财务 → {windcode: rec}"""
+        if not windcodes:
+            return {}
+        q = ("查询" + "、".join(windcodes)
+             + "最新报告期的营业收入、净利润、净资产收益率ROE")
         try:
             df = self._wind_client().call_table(
-                "stock_data", "get_stock_fundamentals",
-                {"question": f"查询{wc}最新报告期的营业收入、净利润、净资产收益率ROE"})
+                "stock_data", "get_stock_fundamentals", {"question": q})
         except Exception as e:
-            logger.debug(f"Wind 财务失败 {wc}: {e}")
-            return None
+            logger.warning(f"⚠️ Wind 财务批量查询失败（{len(windcodes)} 只）: {e}")
+            return {}
         if df is None or getattr(df, "empty", True):
-            return None
+            return {}
+        code_col = next((c for c in ("Wind代码", "代码", "windcode") if c in df.columns), None)
+        if not code_col:
+            logger.warning(f"⚠️ 财务批量结果无代码列: {list(df.columns)}")
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            ret = str(row.get(code_col) or "").strip()
+            if not ret or ret in ("None", "nan"):
+                continue
+            wc = match_requested(windcodes, ret)
+            if not wc:
+                logger.info(f"⏭️ 财务跳过不匹配返回：请求批内无 {ret}")
+                continue
+            rec = self._parse_financial_row(df, row)
+            if rec:
+                out[wc] = rec
+        return out
 
-        row = df.iloc[0]
+    @staticmethod
+    def _parse_financial_row(df: Any, row: Any) -> Optional[Dict[str, Any]]:
+        """
+        DataFrame 某行 → 财务 dict（亿元 → 元，对齐 A 股集合口径）。
+
+        实测列名：Wind代码 / 证券简称 / 日期 / 最新营业收入 / 最新净利润 / 最新净资产收益率ROE
+        注：单只与批量查询列名一致、数值一致（已验证 0002.HK=428.56 两种方式相同），
+        单位为「亿元」（腾讯 0700.HK = 4012.43，即 4012.43 亿元）。
+        """
+        cols = list(df.columns)
 
         def pick(*keys: str) -> Optional[float]:
-            for c in df.columns:
+            for c in cols:
                 if any(k in str(c) for k in keys):
                     return _to_float(row.get(c))
             return None
@@ -726,12 +1274,41 @@ class HKUSPreheatService:
         if revenue_yi is None and net_yi is None and roe is None:
             return None
 
+        label = ""
+        for c in cols:
+            if "日期" in str(c) or "报告期" in str(c):
+                label = str(row.get(c) or "").strip()
+                if label and label not in ("None", "nan"):
+                    break
+                label = ""
+
         return {
             "report_period": "latest",
-            "revenue": revenue_yi * 1e8 if revenue_yi is not None else None,   # 亿元 → 元
+            "report_period_label": label,
+            "revenue": revenue_yi * 1e8 if revenue_yi is not None else None,
             "net_profit": net_yi * 1e8 if net_yi is not None else None,
             "roe": roe,
         }
+
+    def _fetch_financial(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """单只兜底：Wind 查询财务（含代码匹配校验，拒收退市旧实体）"""
+        wc = target["windcode"]
+        try:
+            df = self._wind_client().call_table(
+                "stock_data", "get_stock_fundamentals",
+                {"question": f"查询{wc}最新报告期的营业收入、净利润、净资产收益率ROE"})
+        except Exception as e:
+            logger.debug(f"Wind 财务失败 {wc}: {e}")
+            return None
+        if df is None or getattr(df, "empty", True):
+            return None
+        code_col = next((c for c in ("Wind代码", "代码", "windcode") if c in df.columns), None)
+        if code_col is not None:
+            ret = str(df.iloc[0].get(code_col) or "").strip()
+            if not windcode_matches(wc, ret):
+                logger.info(f"⏭️ Wind 财务代码不匹配，弃用 {wc} ← {ret}")
+                return None
+        return self._parse_financial_row(df, df.iloc[0])
 
     @staticmethod
     def _extract_text(raw: Any) -> str:
@@ -824,12 +1401,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--symbols", default="", help="仅处理指定内部代码，逗号分隔（如 00700,AAPL）")
     p.add_argument("--limit", type=int, default=0, help="首次回看的自然日天数，0 用配置默认")
     p.add_argument("--force", action="store_true", help="强制重查指数成分清单")
+    p.add_argument("--force-full", dest="force_full", action="store_true",
+                   help="忽略增量窗口，按完整 lookback 重建日线历史（修正历史深度不足）")
     return p.parse_args(argv)
 
 
 async def _main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+    # 独立命令行运行时需自行初始化 MongoDB 连接（定时任务路径已由应用初始化）
+    from app.core.database import init_database
+    await init_database()
     svc = HKUSPreheatService()
 
     if args.action in ("indexes", "all", "universe"):
@@ -844,14 +1426,16 @@ async def _main(argv: Optional[List[str]] = None) -> None:
     elif args.action == "universe":
         print(await svc.refresh_universe(force=args.force))
     elif args.action == "daily":
-        print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None))
+        print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None,
+                                   force_full=args.force_full))
     elif args.action == "basic":
         print(await svc.sync_basic_info(symbols=symbols))
     elif args.action == "financial":
         print(await svc.sync_financial(symbols=symbols))
     elif args.action == "all":
         print(await svc.refresh_universe(force=args.force))
-        print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None))
+        print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None,
+                                   force_full=args.force_full))
         print(await svc.sync_basic_info(symbols=symbols))
         print(await svc.sync_financial(symbols=symbols))
 
