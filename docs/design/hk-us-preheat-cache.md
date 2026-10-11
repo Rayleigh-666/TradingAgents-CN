@@ -354,11 +354,16 @@ HK_US_PREHEAT_ENABLED = True
 HK_PREHEAT_CRON = "30 17 * * 1-5"
 US_PREHEAT_CRON = "0 7 * * 1-5"
 HK_US_PREHEAT_LOOKBACK_DAYS = 365
-HK_US_PREHEAT_PRIMARY_SOURCE = "yahoo"     # yahoo | wind
+HK_US_PREHEAT_PRIMARY_SOURCE = "yahoo"     # yahoo | wind（⚠️ 只作用于日线，见 §12）
 HK_US_PREHEAT_ENABLE_FINANCIAL = True
+HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS = 14  # 基础信息刷新周期（天），0 = 不节流
+HK_US_PREHEAT_FINANCIAL_REFRESH_DAYS = 14   # 财务刷新周期（天），0 = 不节流
 ```
 
 沿用现有惯例：未启用时 `scheduler.pause_job(...)`（参考 `main.py:631`）。
+
+⚠️ cron 是**日频**且保持不变：日线需要每天增量更新，而基础信息/财务靠
+`*_REFRESH_DAYS` 节流（见 §12），不需要为它们单独降频。
 
 ---
 
@@ -666,6 +671,68 @@ Yahoo 侧 `BRK-B` 最新收盘 515.62 与库内 Wind 值一致。
 | 全量增量日线 | `{'total':1190,'ok':0,'skipped':1190,'rows':0,'failed':0}`，耗时 90.4s（与改前同量级） |
 | 基础信息 / 财务增量 | 见执行日志（幂等，无回归） |
 | 前端 | `eslint src/utils/stockValidator.ts src/views/Analysis/SingleAnalysis.vue` 零告警 |
+
+## 12. 元数据刷新节流（v5）：把 Wind 积分降下来
+
+### 12.1 起因：主源配置只管日线
+
+首次全量预热后实测消耗 Wind 积分 2000+。核对代码发现「Yahoo 已通」**只覆盖了日线**：
+
+| 数据 | 主源 | 备源 | 受 `HK_US_PREHEAT_PRIMARY_SOURCE` 控制 |
+| --- | --- | --- | --- |
+| 日线 K 线 | **Yahoo**（`yf.download` 批量 60/批） | Wind，仅 Yahoo 返回空时逐只回落 | ✅ 是 |
+| 基础信息 | **Wind** `get_stock_basicinfo`（40/批） | Yahoo，仅 Wind 认不出的代码 | ❌ 硬编码 Wind |
+| 财务 | **Wind** `get_stock_fundamentals`（40/批） | 无（宁缺勿错） | ❌ 硬编码 Wind |
+| 指数成分反查 | **Wind** | 无（7 天缓存） | ❌ 硬编码 Wind |
+
+代码上：`_fetch_kline()` 读 `HK_US_PREHEAT_PRIMARY_SOURCE` 决定 yahoo/wind 顺序，
+而 `sync_basic_info()` / `sync_financial()` 直接调 Wind，完全不读该配置。
+
+更关键的是**日线有增量判断、基础信息/财务没有**：`_incremental_limit()` 会按库内最新
+`trade_date` 决定是否拉取；而 `_load_targets()` 取全部 `enabled` 标的后无条件全量重拉。
+两个 cron 合计 HK 673 + US 517 只、基础信息与财务各一遍 ⇒ **每天固定烧约 2380 积分**，
+与数据是否变化无关。
+
+### 12.2 方案：A 节流 + C 降频（周期 14 天）
+
+日线必须保持日频（否则前端最多看到两周前的行情），因此「两周一次」只落在基础信息/财务上：
+
+- 新增 `HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS` / `HK_US_PREHEAT_FINANCIAL_REFRESH_DAYS`，默认 **14**（0 = 关闭节流）；
+- `sync_basic_info()` / `sync_financial()` 新增 `force` 参数；`_split_fresh()` 一次 `find`
+  拉出各 market 的 `symbol → updated_at` 映射，库内更新未超期的标的**整体跳过**——
+  不查 Wind、不查 Yahoo、不计入 failed，而是计入 `stats["skipped"]`；
+- **cron 保持不变**：日线照旧日频增量，基础信息/财务每 14 天才真正打一次 Wind；
+- 手动补数据走 CLI `--force-meta`（或 `run_hk_preheat(force_meta=True)`）。
+
+积分影响：约 2380/天 → 约 2380/14 天 ≈ **170/天**。
+
+### 12.3 边界处理
+
+| 场景 | 行为 |
+| --- | --- |
+| `updated_at` 为 ISO 字符串 / 带时区 datetime | `_as_naive_dt()` 统一归一化为本地 naive，避免 naive/aware 比较抛 `TypeError` |
+| `updated_at` 缺失或无法解析 | 视为不新鲜 → 本次刷新（对新入池标的天然生效） |
+| `refresh_days = 0` | 关闭节流，等价于旧的「每次全量」（逃生舱） |
+| 部分标的过期 | 仅对 stale 子集发起批量查询，fresh 不产生任何请求 |
+| `force = True` | 忽略节流，全量刷新 |
+
+### 12.4 验证
+
+| 验证项 | 结果 |
+| --- | --- |
+| 单元测试 | `tests/test_hk_us_preheat_meta_throttle.py` 共 10 例全通过（时间归一化边界 / 新鲜判定 / 拆分 / 零请求路径 / force 绕过 / 新标的立即刷新） |
+| 真实库预演（只读） | HK basic 673 fresh / 0 stale；HK financial 673 / 0；US basic 517 / 0；US financial 508 / **9 stale** |
+| 真实同步（HK） | basic `{total:673, ok:0, failed:0, skipped:673, batches:0}`、financial 同 → **零外部请求** |
+
+### 12.5 ⚠️ 已知副作用：永久无数据的标的会持续重试
+
+US 财务那 9 只 stale 正是 §10.5 提到的「Wind 无有效命中」标的
+（GOOG / COR / DD / DOW / FOX / FOXA / IR / Q / WTW）。它们因同步失败而库内无记录，
+`_split_fresh()` 每轮都判为 stale ⇒ **每天仍会被重试 9 次**。
+
+当前判断为可接受（约 9/天，占总量的 0.4%，且保留「Wind 侧后续补上数据可自动拉到」的能力），
+故未额外引入失败标记机制。若后续需要彻底消除，可给失败记录写一个 `attempted_at`
+并为其设置更长的重试周期（例如 3 天）。
 
 ## 附：本次勘察的代码索引
 

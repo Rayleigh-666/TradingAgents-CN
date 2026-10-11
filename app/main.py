@@ -895,7 +895,9 @@ async def lifespan(app: FastAPI):
         else:
             logger.info(
                 f"⭐ 港美股预热已配置: HK {settings.HK_PREHEAT_CRON} / US {settings.US_PREHEAT_CRON} "
-                f"(主源 {settings.HK_US_PREHEAT_PRIMARY_SOURCE})"
+                f"(日线主源 {settings.HK_US_PREHEAT_PRIMARY_SOURCE}，日频增量；"
+                f"基础信息/财务走 Wind，每 "
+                f"{settings.HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS} 天刷新以省积分)"
             )
 
         # 新闻数据同步任务配置（使用AKShare同步所有股票新闻）

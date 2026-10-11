@@ -298,6 +298,17 @@ class Settings(BaseSettings):
     HK_US_PREHEAT_ENABLE_BASIC_INFO: bool = Field(
         default=True, description="预热时同步港美股基础信息"
     )
+    # 基础信息/财务的「主源」是 Wind（日线主源才是 HK_US_PREHEAT_PRIMARY_SOURCE），
+    # 会实际消耗 Wind 积分；而这二者变化很慢，故按周期节流，不随日频 cron 全量重拉。
+    HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS: int = Field(
+        default=14, ge=0, le=365,
+        description="基础信息刷新周期（天）。库内 updated_at 距今未超过该天数的标的直接跳过，"
+                    "不发起任何 Wind/Yahoo 请求；0 表示不节流（每次全量刷新）"
+    )
+    HK_US_PREHEAT_FINANCIAL_REFRESH_DAYS: int = Field(
+        default=14, ge=0, le=365,
+        description="财务数据刷新周期（天），语义同基础信息；0 表示不节流"
+    )
     HK_US_PREHEAT_BATCH_SLEEP_SECONDS: float = Field(
         default=0.15, ge=0, le=5, description="批量同步时每个批次之间的间隔（秒），用于限流保护"
     )

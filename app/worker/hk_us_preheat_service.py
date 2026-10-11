@@ -57,6 +57,12 @@ K 线接口 `app/routers/stocks.py:963-985` 在 `_detect_market_and_code` 之后
 2. **基础信息 / 财务**：Wind `get_stock_basicinfo` / `get_stock_fundamentals`
    支持一次传多个代码（`HK_US_PREHEAT_WIND_BATCH_SIZE`，默认 40，实测 20 只约 2.5s，
    而逐只 1.3s/只），批内未覆盖的代码再逐只兜底重试。
+3. **基础信息 / 财务节流**（省 Wind 积分）：这两类的**主源是 Wind**，
+   `HK_US_PREHEAT_PRIMARY_SOURCE` 只作用于日线。它们变化很慢，故按
+   `HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS` / `_FINANCIAL_REFRESH_DAYS`（默认 14 天）
+   节流——库内 `updated_at` 未超期的标的整体跳过、不发起任何请求。日线仍为日频
+   增量，故两个 cron 无需改动；典型约 1190 只标的的积分消耗从 ~2380/天 降到 ~170/天。
+   CLI 可用 `--force-meta` 绕过节流强制刷新。
 
 **`--force-full`**：忽略增量窗口，按完整 lookback 重取全历史，并从本批第一根 K 线
 重置 `pre_close/change/pct_chg` 起算点（`from_scratch`）。用于修正「首次只跑了短窗口
@@ -974,6 +980,66 @@ class HKUSPreheatService:
                 })
         return out
 
+    # ---------- 元数据刷新节流（基础信息 / 财务） ----------
+
+    @staticmethod
+    def _as_naive_dt(value: Any) -> Optional[datetime]:
+        """
+        把库内 `updated_at` 归一化为「本地 naive datetime」，便于与 cutoff 比较。
+
+        兼容 datetime / ISO 字符串 / None：无法识别时返回 None（调用方视为不新鲜）。
+        带时区的值统一换算到本地时区再去掉 tzinfo，避免 naive/aware 比较抛 TypeError。
+        """
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+
+    @classmethod
+    def _is_fresh(cls, updated_at: Any, cutoff: datetime) -> bool:
+        """库内更新时间不早于 cutoff 即视为新鲜（本次可跳过，省一次外部请求）"""
+        dt = cls._as_naive_dt(updated_at)
+        return dt is not None and dt >= cutoff
+
+    async def _split_fresh(self, kind: str, targets: List[Dict[str, str]],
+                           refresh_days: int
+                           ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        """
+        按「库内 updated_at 是否在 refresh_days 天内」把 targets 拆为 (fresh, stale)。
+
+        - fresh：已有较新数据，本次整体跳过，不发起任何 Wind/Yahoo 请求（省积分）；
+        - stale：需要刷新；
+        - `refresh_days <= 0` 表示不节流，全部按 stale 处理。
+
+        库内一次 `find` 拉取各 market 的 (symbol → updated_at) 映射，不逐只查库。
+        """
+        if refresh_days <= 0:
+            return [], list(targets)
+        db = get_mongo_db()
+        cutoff = datetime.now() - timedelta(days=refresh_days)
+        updated_map: Dict[str, Any] = {}
+        for mk in {t["market"] for t in targets}:
+            coll = db[_coll_names(mk)[kind]]
+            async for d in coll.find({}, {"symbol": 1, "updated_at": 1}):
+                updated_map[f"{mk}:{d.get('symbol')}"] = d.get("updated_at")
+        fresh: List[Dict[str, str]] = []
+        stale: List[Dict[str, str]] = []
+        for t in targets:
+            key = f"{t['market']}:{t['symbol']}"
+            if self._is_fresh(updated_map.get(key), cutoff):
+                fresh.append(t)
+            else:
+                stale.append(t)
+        return fresh, stale
+
     async def _last_trade_date(self, coll, symbol: str) -> Optional[str]:
         """库内该 symbol 的最新交易日（"YYYY-MM-DD"），无数据返回 None"""
         doc = await coll.find_one({"symbol": symbol}, {"trade_date": 1},
@@ -1200,7 +1266,8 @@ class HKUSPreheatService:
     # ==================== 三、基础信息同步 ====================
 
     async def sync_basic_info(self, symbols: Optional[List[str]] = None,
-                              market: Optional[str] = None) -> Dict[str, Any]:
+                              market: Optional[str] = None,
+                              force: bool = False) -> Dict[str, Any]:
         """
         同步基础信息到 `stock_basic_info_<hk|us>`。
         数据检验读取字段：symbol / code / name / list_date。
@@ -1208,18 +1275,28 @@ class HKUSPreheatService:
         批量策略：Wind `get_stock_basicinfo` 支持一次查询多个代码
         （实测 20 只 2.5s，逐只 1.3s/只），故按 `WIND_BATCH_SIZE` 分批，
         批内未覆盖的代码再逐只兜底重试。
+
+        节流：`HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS` 天内已同步过的标的直接跳过，
+        不发起任何外部请求（基础信息几乎不变，无需随日频 cron 全量重拉）。
+        `force=True` 忽略节流，强制全量刷新。
         """
         db = get_mongo_db()
         targets = await self._load_targets(symbols, market)
-        stats = {"total": len(targets), "ok": 0, "failed": 0,
+        refresh_days = 0 if force else int(settings.HK_US_PREHEAT_BASIC_INFO_REFRESH_DAYS or 0)
+        fresh, stale = await self._split_fresh("basic", targets, refresh_days)
+        stats = {"total": len(targets), "ok": 0, "failed": 0, "skipped": len(fresh),
                  "failed_symbols": [], "batches": 0}
         now = datetime.now()
         batch_size = int(settings.HK_US_PREHEAT_WIND_BATCH_SIZE or 40)
+        if fresh:
+            logger.info(f"  ⏭️ 基础信息节流跳过 {len(fresh)} 只"
+                        f"（{refresh_days} 天内已同步），本次待刷新 {len(stale)} 只")
 
-        info_map = await self._collect_basic_info(targets, batch_size, stats)
-        await self._retry_missing_basic(targets, info_map, stats)
+        info_map = await self._collect_basic_info(stale, batch_size, stats) if stale else {}
+        if stale:
+            await self._retry_missing_basic(stale, info_map, stats)
 
-        for t in targets:
+        for t in stale:
             market_, symbol = t["market"], t["symbol"]
             coll = db[_coll_names(market_)["basic"]]
             info = info_map.get(t["windcode"])
@@ -1425,22 +1502,32 @@ class HKUSPreheatService:
     # ==================== 四、财务同步 ====================
 
     async def sync_financial(self, symbols: Optional[List[str]] = None,
-                             market: Optional[str] = None) -> Dict[str, Any]:
+                             market: Optional[str] = None,
+                             force: bool = False) -> Dict[str, Any]:
         """
         同步财务数据到 `stock_financial_data_<hk|us>`（Wind 多代码批量查询）。
 
         批量：`get_stock_fundamentals` 支持一次查询多只（实测 15 只 2.8s），
         批内未覆盖的代码再逐只兜底。
+
+        节流：`HK_US_PREHEAT_FINANCIAL_REFRESH_DAYS` 天内已同步过的标的直接跳过。
+        财务按报告期变化（季报节奏），随日频 cron 全量重拉纯属浪费 Wind 积分。
+        `force=True` 忽略节流，强制全量刷新。
         """
         db = get_mongo_db()
         targets = await self._load_targets(symbols, market)
-        stats = {"total": len(targets), "ok": 0, "failed": 0,
+        refresh_days = 0 if force else int(settings.HK_US_PREHEAT_FINANCIAL_REFRESH_DAYS or 0)
+        fresh, stale = await self._split_fresh("financial", targets, refresh_days)
+        stats = {"total": len(targets), "ok": 0, "failed": 0, "skipped": len(fresh),
                  "failed_symbols": [], "batches": 0}
         now = datetime.now()
         batch_size = int(settings.HK_US_PREHEAT_WIND_BATCH_SIZE or 40)
+        if fresh:
+            logger.info(f"  ⏭️ 财务节流跳过 {len(fresh)} 只"
+                        f"（{refresh_days} 天内已同步），本次待刷新 {len(stale)} 只")
 
-        rec_map = await self._collect_financial(targets, batch_size, stats)
-        missing = [t for t in targets if t["windcode"] not in rec_map]
+        rec_map = await self._collect_financial(stale, batch_size, stats) if stale else {}
+        missing = [t for t in stale if t["windcode"] not in rec_map]
         for t in missing:
             if t.get("yahoo_only"):
                 continue  # Wind 无法确认该代码，财务无第二来源（宁缺勿错）
@@ -1448,7 +1535,7 @@ class HKUSPreheatService:
             if rec:
                 rec_map[t["windcode"]] = rec
 
-        for t in targets:
+        for t in stale:
             market_, symbol = t["market"], t["symbol"]
             coll = db[_coll_names(market_)["financial"]]
             rec = rec_map.get(t["windcode"])
@@ -1648,29 +1735,33 @@ class HKUSPreheatService:
 
 # ==================== 便捷入口（供定时任务调用） ====================
 
-async def run_hk_preheat(full: bool = False) -> Dict[str, Any]:
-    """港股预热：universe → 日线 → 基础信息 → 财务"""
+async def run_hk_preheat(full: bool = False, force_meta: bool = False) -> Dict[str, Any]:
+    """港股预热：universe → 日线 → 基础信息 → 财务
+
+    `full=True` 强制重查指数成分清单；`force_meta=True` 忽略基础信息/财务的
+    刷新周期节流（用于手动补数据），日线走各自的增量窗口。
+    """
     svc = HKUSPreheatService()
     await svc.ensure_indexes()
     await svc.refresh_universe(force=full)
     result = {"daily": await svc.sync_daily(market="HK")}
     if settings.HK_US_PREHEAT_ENABLE_BASIC_INFO:
-        result["basic"] = await svc.sync_basic_info(market="HK")
+        result["basic"] = await svc.sync_basic_info(market="HK", force=force_meta)
     if settings.HK_US_PREHEAT_ENABLE_FINANCIAL:
-        result["financial"] = await svc.sync_financial(market="HK")
+        result["financial"] = await svc.sync_financial(market="HK", force=force_meta)
     return result
 
 
-async def run_us_preheat(full: bool = False) -> Dict[str, Any]:
-    """美股预热：universe → 日线 → 基础信息 → 财务"""
+async def run_us_preheat(full: bool = False, force_meta: bool = False) -> Dict[str, Any]:
+    """美股预热：universe → 日线 → 基础信息 → 财务（参数语义同 `run_hk_preheat`）"""
     svc = HKUSPreheatService()
     await svc.ensure_indexes()
     await svc.refresh_universe(force=full)
     result = {"daily": await svc.sync_daily(market="US")}
     if settings.HK_US_PREHEAT_ENABLE_BASIC_INFO:
-        result["basic"] = await svc.sync_basic_info(market="US")
+        result["basic"] = await svc.sync_basic_info(market="US", force=force_meta)
     if settings.HK_US_PREHEAT_ENABLE_FINANCIAL:
-        result["financial"] = await svc.sync_financial(market="US")
+        result["financial"] = await svc.sync_financial(market="US", force=force_meta)
     return result
 
 
@@ -1685,6 +1776,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--force", action="store_true", help="强制重查指数成分清单")
     p.add_argument("--force-full", dest="force_full", action="store_true",
                    help="忽略增量窗口，按完整 lookback 重建日线历史（修正历史深度不足）")
+    p.add_argument("--force-meta", dest="force_meta", action="store_true",
+                   help="忽略基础信息/财务的刷新周期节流，强制重新拉取（会消耗 Wind 积分）")
     return p.parse_args(argv)
 
 
@@ -1711,15 +1804,15 @@ async def _main(argv: Optional[List[str]] = None) -> None:
         print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None,
                                    force_full=args.force_full))
     elif args.action == "basic":
-        print(await svc.sync_basic_info(symbols=symbols))
+        print(await svc.sync_basic_info(symbols=symbols, force=args.force_meta))
     elif args.action == "financial":
-        print(await svc.sync_financial(symbols=symbols))
+        print(await svc.sync_financial(symbols=symbols, force=args.force_meta))
     elif args.action == "all":
         print(await svc.refresh_universe(force=args.force))
         print(await svc.sync_daily(symbols=symbols, lookback_days=args.limit or None,
                                    force_full=args.force_full))
-        print(await svc.sync_basic_info(symbols=symbols))
-        print(await svc.sync_financial(symbols=symbols))
+        print(await svc.sync_basic_info(symbols=symbols, force=args.force_meta))
+        print(await svc.sync_financial(symbols=symbols, force=args.force_meta))
 
 
 if __name__ == "__main__":
