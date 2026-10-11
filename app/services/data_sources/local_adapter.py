@@ -99,34 +99,42 @@ class LocalAdapter(DataSourceAdapter):
             return None
 
     def get_realtime_quotes(self) -> Optional[Dict[str, Dict[str, Optional[float]]]]:
-        """获取实时行情（从本地数据库读取）"""
+        """获取实时行情（从本地数据库读取）
+
+        只读取用户手工导入、标记为 data_source='local' 的行情。
+        定时同步服务（quotes_ingestion_service）写入的行情不带该字段，
+        若不过滤会把全市场同步行情误报成 local 来源（历史 bug）。
+        """
         try:
             from app.core.database import get_mongo_db_sync
             db = get_mongo_db_sync()
             collection = db.market_quotes
-            
-            # 查询所有行情数据
-            cursor = collection.find({})
+
+            # 仅查询手工导入的行情（同步写入的文档没有 data_source 字段）
+            cursor = collection.find(
+                {"data_source": "local"},
+                {"symbol": 1, "code": 1, "close": 1, "pct_chg": 1, "amount": 1, "_id": 0},
+            )
             quotes = list(cursor)
-            
+
             if not quotes:
                 logger.info("Local: No local quotes found")
                 return None
-            
+
             # 转换为字典格式
             result = {}
             for quote in quotes:
-                symbol = quote.get('symbol')
+                symbol = quote.get('symbol') or quote.get('code')
                 if symbol:
                     result[symbol] = {
                         'close': quote.get('close'),
                         'pct_chg': quote.get('pct_chg'),
                         'amount': quote.get('amount')
                     }
-            
+
             logger.info(f"Local: Successfully fetched {len(result)} quotes")
             return result
-            
+
         except Exception as e:
             logger.error(f"Local: Failed to fetch realtime quotes: {e}")
             return None
