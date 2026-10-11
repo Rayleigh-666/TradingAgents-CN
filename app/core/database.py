@@ -595,6 +595,9 @@ async def create_database_indexes(db):
         await market_quotes.create_index([("pct_chg", -1)])
         await market_quotes.create_index([("amount", -1)])
         await market_quotes.create_index([("updated_at", -1)])
+        # 🔥 LocalAdapter 只读手工导入（data_source='local'）的行情，
+        # 无该索引时会退化为集合扫描
+        await market_quotes.create_index([("data_source", 1)])
 
         industry_mapping = db["stock_industry_mappings"]
         await industry_mapping.create_index([("code", 1)], unique=True)

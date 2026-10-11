@@ -364,7 +364,7 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
         (market, normalized_code): 市场类型和标准化后的代码
             - CN: A股（6位数字）
             - HK: 港股（4-5位数字或带.HK后缀）
-            - US: 美股（字母代码）
+            - US: 美股（1-5位字母，可带股份类别如 BRK.B / BRK-B）
     """
     code = code.strip().upper()
 
@@ -372,8 +372,14 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
     if code.endswith('.HK'):
         return ('HK', code[:-3].zfill(5))  # 移除.HK，补齐到5位
 
+    # 美股：1-5位字母 + 股份类别（BRK.B / BRK-B → 统一存为 BRK.B）
+    # ⚠️ 必须放在「默认 A 股」之前，否则 BRK.B 会被误判成 A 股代码走 A 股链路
+    cls_match = re.match(r'^([A-Z]{1,5})[.\-]([A-Z])$', code)
+    if cls_match:
+        return ('US', f"{cls_match.group(1)}.{cls_match.group(2)}")
+
     # 美股：纯字母
-    if re.match(r'^[A-Z]+$', code):
+    if re.match(r'^[A-Z]{1,5}$', code):
         return ('US', code)
 
     # 港股：4-5位数字

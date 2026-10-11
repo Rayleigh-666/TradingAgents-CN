@@ -578,6 +578,95 @@ _get_source_priority('US') → ['yfinance', 'alpha_vantage', 'finnhub']
 | US 银行营收缺失               | `JPM`/`BAC` 等银行 `最新营业收入` 上游返回空（净利/ROE 正常），非本项目问题                   |
 | 覆盖度                     | 日线/基础信息 1190/1190；财务 1181/1190（缺 9 只，见 10.4，属有意取舍）                 |
 
+## 11. 交叉 Review 修正记录（v4）
+
+来源：`reports/2026-10-11-cross-review-hkus-preheat.md`。P0–P3 全部处理，逐项列明改动与验证方式。
+
+### 11.1 P0 工作区设计文档被旧版覆盖 —— 已恢复
+
+工作区版本是实施前的 v2（474 行），把已推送的 v3（593 行，含 10.x 全量实测）覆盖掉了。
+已 `git checkout` 恢复推送版本，本文件即恢复后的 v3（并追加本节）。
+
+### 11.2 P1 跨数据源切换产生同一交易日重复记录 —— 已修
+
+**问题**：日线唯一键含 `data_source`，而 K 线接口只按 `{symbol, period}` 过滤。
+路径 A（`HK_US_PREHEAT_PRIMARY_SOURCE=wind` 或 `USE_BATCH=False`）的 `_upsert_daily`
+只做 upsert、不清异源旧行，且写入的是整个增量窗口（含 ≤ 库内最新日期的缓冲行），
+于是同一交易日会留下 Yahoo + Wind 两行 → 接口返回重复交易日。
+
+**改法**：`_upsert_daily` 写入前调用 `_purge_conflicting_dates()`，按**本次写入的
+`trade_date` 精确删除其它来源的旧行**。
+
+> 为什么不直接「删除该 symbol 全部异源行」（review 建议的原方案）：
+> 路径 A 的增量窗口可能只有 6 天，若直接删光异源行再写 4 根，会把该标的
+> 250 根历史砍成 4 根。按日期精确清理既能消除重复，又保证历史永不缩短。
+
+**验证**：构造 `yahoo` 3 行（含 1 个本次不覆盖的旧日期）+ 以 `wind` 写同窗口 3 行，
+结果为 4 行、**0 个重复交易日**、未被覆盖的历史行保留。
+
+### 11.3 P2 美股自选股 windcode 缺交易所后缀 —— 已修
+
+**问题**：`_merge_favorites` 美股分支直接 `windcode = raw_code`（裸 ticker），
+而 Wind 接口要求带后缀 → 财务永远失败、基础信息每次白打一次无效调用、Wind 备源失效。
+
+**改法**：新增 `_resolve_us_windcodes()`（`refresh_universe` 收尾调用），
+按 `WIND_BATCH_SIZE` 反查 Wind 代码并**过 `windcode_matches` 校验**；
+批量未覆盖的逐个兜底重试。补全成功写回 `windcode/yahoocode/full_symbol`；
+Wind 无法确认的（如会被解析成伦敦 `BRK.L` 的 `BRK.B`）打标 `yahoo_only=True`，
+`_load_targets` 透出该标记，日线/基础信息/财务三条取数链路全部跳过 Wind。
+
+**验证**：`TSM`→`TSM.N`、`MSFT`→`MSFT.O`、`BRK.B`→`BRK_B.N` 均补全成功；
+现网 517 只美股中已无缺后缀标的。
+
+### 11.4 P2 点号类股票代码（BRK.B）—— 已修
+
+**实测更正**（与 review 描述略有出入）：Wind 用**下划线**表示股份类别
+（`BRK_B.N`，不是 `BRK.B.N`），且 `BRK`/`AAPL` 等裸 ticker 在**基础信息**接口可正常解析。
+真正的坑是 `to_internal_symbol("BRK.B.N")` → 归并出 `BRK`（撞 A 类）、
+`to_yahoo_ticker` 给出 `BRK`（Yahoo 的 `BRK` 是 A 类），**会把 A 类行情写进 B 类 symbol**。
+
+**改法**（四处 + 一次数据迁移）：
+
+| 位置 | 改动 |
+| --- | --- |
+| 预热服务 `to_internal_symbol` | 美股内部 symbol 统一为点号形式（`BRK_B.N` → `BRK.B`），只剥离已知交易所后缀 |
+| 预热服务 `to_yahoo_ticker` | 点号 → 连字符（`BRK_B.N` → `BRK-B`；`CBOE.BAT` → `CBOE`） |
+| 预热服务 `windcode_matches` | 改为**带股份类别**比对（`BRK.B` ≠ `BRK`，也 ≠ 仅共享前缀的 `BRK.L`） |
+| `stocks.py:_detect_market_and_code` | 放行 `^[A-Z]{1,5}[.\-][A-Z]$`，`BRK-B` 归一为 `BRK.B`；放在「默认 A 股」之前 |
+| `stock_utils.identify_stock_market` | 同样放行点号/连字符形式 |
+| 数据迁移 | 已把现网 `BRK_B`/`BF_B` → `BRK.B`/`BF.B`（universe + 日线 + 基础信息 + 财务，各 267 行日线） |
+
+**踩到并已修的连带问题**：
+- 交易所后缀白名单漏了 `BAT`（Cboe BZX，`CBOE.BAT`）→ 会把 `yahoocode` 写成 `CBOE-BAT`。
+  已按现网 517 只美股实测分布（`O` 172 / `N` 344 / `BAT` 1）补全白名单；
+  **刻意不收录单字母 `A/B/C`**——那正是股份类别写法。
+- 后缀白名单若只按「含点号」判断待补全，会漏掉 `BRK.B` 这类既有类股票点号、又没交易所后缀的输入。
+  已改为按「末段不是已知交易所后缀」判断。
+
+**验证**：`BRK.B`/`BRK-B` → US `BRK.B`；`windcode_matches("BRK_B.N","BRK.L")=False`；
+Yahoo 侧 `BRK-B` 最新收盘 515.62 与库内 Wind 值一致。
+
+### 11.5 P3 五项
+
+| 项 | 改动 |
+| --- | --- |
+| P3-1 批量日线内存驻留 | `_yahoo_batch`（返回整市场 map）拆为 `_yahoo_download_chunk`（单批）；`_sync_daily_batch` 改为**下载一批 → 立即写库 → 释放**，峰值内存只与 `BATCH_SIZE` 相关 |
+| P3-2 薄覆盖判定口径 | 原按「Yahoo 原始行数」触发，已是最新的标的每次仍会白打一次完整 lookback 的 Wind。改为仅在**库内同样覆盖不足**（`existing < 5`）或 `force_full` 时才试 Wind |
+| P3-3 前端误判静默化 | 新增 `looksLikeTruncatedCNCode()`：`^[15]\d{4}$` 不再被静默当成港股（`51005` → 提示疑似缺位而非切港股）；`SingleAnalysis.vue` 的市场切换由「A股/ETF → 港美股」改为**双向联动**（港股/美股下输 `600519`/`AAPL` 同样自动切换） |
+| P3-4 universe 无移除路径 | 新增 `_prune_source()`：指数重查后摘掉已剔除成分的标签，无其它来源则 `enabled=False`；自选股删除同样摘标签。`stats[source_tag]` 统一为「写入后 enabled 计数」（原先「新鲜跳过」与「刚刷新」口径不一致） |
+| P3-5 LocalAdapter 索引 | `create_database_indexes` 补 `market_quotes.{data_source:1}` 索引，避免 `find({"data_source":"local"})` 集合扫描 |
+
+### 11.6 回归验证
+
+| 验证项 | 结果 |
+| --- | --- |
+| 代码转换/守卫单测 | `to_internal_symbol` / `to_yahoo_ticker` / `windcode_matches` 共 27 个用例全通过 |
+| P1 重复交易日 | 构造用例：0 个重复交易日、未覆盖历史保留 |
+| universe 清理与后缀补全 | `_prune_source` 摘标签+按需禁用 2/2 正确；`TSM`/`MSFT`/`BRK.B` 补全 3/3 正确 |
+| 全量增量日线 | `{'total':1190,'ok':0,'skipped':1190,'rows':0,'failed':0}`，耗时 90.4s（与改前同量级） |
+| 基础信息 / 财务增量 | 见执行日志（幂等，无回归） |
+| 前端 | `eslint src/utils/stockValidator.ts src/views/Analysis/SingleAnalysis.vue` 零告警 |
+
 ## 附：本次勘察的代码索引
 
 | 位置                                                | 内容                                       |

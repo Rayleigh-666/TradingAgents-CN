@@ -862,7 +862,7 @@ import TaskGrowthPanel from '@/components/growth/TaskGrowthPanel.vue'
 import { ANALYSTS, convertAnalystNamesToIds } from '@/constants/analysts'
 import { marked } from 'marked'
 import { recommendModels } from '@/api/modelCapabilities'
-import { validateStockCode, getStockCodeFormatHelp } from '@/utils/stockValidator'
+import { validateStockCode, getStockCodeFormatHelp, looksLikeTruncatedCNCode } from '@/utils/stockValidator'
 import { normalizeMarketForAnalysis, getMarketByStockCode } from '@/utils/market'
 import { fetchTaskResultWithRetry, hasTaskResultContent, mergeTaskResult } from '@/utils/taskResult'
 import type { StockInfo } from '@/types/analysis'
@@ -1199,28 +1199,23 @@ const validateStockCodeInput = () => {
       }
     }
 
-    // 🔥 智能切换：当前市场校验失败、但代码符合港股/美股格式时自动切换市场
-    if (analysisForm.market === 'A股' || analysisForm.market === 'ETF') {
-      const hkCheck = validateStockCode(code, '港股')
-      if (hkCheck.valid) {
-        analysisForm.market = '港股'
-        analysisForm.stockCode = hkCheck.normalizedCode || code
-        stockCodeError.value = ''
-        stockCodeHelp.value = `✓ ${hkCheck.market}代码格式正确`
-        onMarketChange()
-        ElMessage.success('已自动识别为港股')
-        return
-      }
-
-      const usCheck = validateStockCode(code, '美股')
-      if (usCheck.valid) {
-        analysisForm.market = '美股'
-        analysisForm.stockCode = usCheck.normalizedCode || code
-        stockCodeError.value = ''
-        stockCodeHelp.value = `✓ ${usCheck.market}代码格式正确`
-        onMarketChange()
-        ElMessage.success('已自动识别为美股')
-        return
+    // 🔥 智能切换：当前市场校验失败时，尝试其它市场（港股/美股/A股），
+    //    唯一命中即自动切换 —— 双向联动，港美股市场下手输 A股/对方市场代码同样生效。
+    //    疑似「6位代码少写一位」的输入不参与切换，避免误判成港股。
+    if (!looksLikeTruncatedCNCode(code)) {
+      const fallbackOrder: MarketType[] = ['港股', '美股', 'A股']
+      for (const candidate of fallbackOrder) {
+        if (candidate === analysisForm.market) continue
+        const check = validateStockCode(code, candidate)
+        if (check.valid) {
+          analysisForm.market = candidate
+          analysisForm.stockCode = check.normalizedCode || code
+          stockCodeError.value = ''
+          stockCodeHelp.value = `✓ ${check.market}代码格式正确`
+          onMarketChange()
+          ElMessage.success(`已自动识别为${candidate}`)
+          return
+        }
       }
     }
 

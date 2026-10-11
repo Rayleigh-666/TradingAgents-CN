@@ -21,15 +21,31 @@ K 线接口 `app/routers/stocks.py:963-985` 在 `_detect_market_and_code` 之后
 - Wind `search_stocks` 单次最多返回 100 条，标普500(502)/港股通(667) 会被截断
   → 采用「达上限即细分」的递归分批策略（美股按 A-Z，港股按 0-9）
 - 美股后缀有两种：`.O`(纳斯达克) / `.N`(纽交所)，必须使用 Wind 返回值，不可自拼
-- Wind 传无后缀 `AAPL` 返回空，必须带后缀
+- **股份类别**：Wind 用下划线（`BRK_B.N`），Yahoo 用连字符（`BRK-B`）；内部 symbol 统一为
+  点号（`BRK.B`）。三处不一致必须经 `to_internal_symbol` / `to_yahoo_ticker` 转换，
+  否则 `BRK_B` 会退化成 `BRK`（撞上 Yahoo 的 A 类行情）或错误取到 A 类数据。
+- Wind 传无后缀 `AAPL` 时，基础信息接口可解析出 `AAPL.O`（用作自选股后缀补全），
+  但**日线/财务接口要求带后缀**；带点号/连字符（`BRK.B`/`BRK-B`）会被误解析成
+  伦敦上市的 `BRK.L`，故自选股后缀补全一律用下划线形式查询并过 `windcode_matches` 校验。
 - 港股 Wind 代码为 **4 位**（`0002.HK`），与 Yahoo 格式一致；内部 symbol 为 5 位（`00002`）
 - 自选股存储在 `users.favorite_stocks` 内嵌数组（字段含 `market`），非独立集合
-- ⚠️ Wind 代码解析器会把**已退市**实体模糊匹配回来（`AMZN.O`→`AMAZ.OO`、
-  `COR.N`→`COR!.N`、`DD.N`→`DD!.N`、`FOXA.O`→`TFCFA.O`），
+- ⚠️ Wind 代码解析器会把**已退市/同前缀**实体模糊匹配回来（`AMZN.O`→`AMAZ.OO`、
+  `COR.N`→`COR!.N`、`DD.N`→`DD!.N`、`FOXA.O`→`TFCFA.O`、`BRK.B`→`BRK.L`），
   `!` 是 Wind 的退市标记。标普500 中 COR/DD/DOW/FOX 等「代码被复用」的标的最易中招。
-  故所有 Wind 返回都必须过 `windcode_matches()` 校验，不匹配一律弃用；
+  故所有 Wind 返回都必须过 `windcode_matches()` 校验（**带上股份类别一起比**，
+  `BRK.B` 不能与 `BRK` 或仅共享前缀的 `BRK.L` 视为同一标的），不匹配一律弃用；
   基础信息另加「证券简称含『退市』」判定（实测 AVB 在市却被 Wind 标为退市），
   命中即转 Yahoo 兜底；财务则计入失败清单，宁缺勿错。
+- 自选股若 Wind 无法确认代码（`_resolve_us_windcodes` 反查失败），打标 `yahoo_only`，
+  取数链路跳过 Wind，只用 Yahoo（避免白打调用与误写他司数据）。
+
+唯一键与「单来源」保证
+----------------------
+日线集合唯一键为 `symbol+trade_date+data_source+period`，而 K 线接口只按
+`{symbol, period}` 过滤 → 同一交易日若同时存在 Yahoo 与 Wind 两行，接口会返回
+**重复交易日**。故写入时统一保证「同一 symbol 同一交易日只有一行」：
+`_upsert_daily` 按本次写入的 `trade_date` 精确清除异源旧行（不误删未覆盖的历史），
+`_write_single_source` 用于整源切换（先清异源再整体写入）。
 
 吞吐优化（本期）
 ----------------
@@ -119,16 +135,41 @@ def _coll_names(market: str) -> Dict[str, str]:
 
 # ==================== 代码转换 ====================
 
+# Wind 美股「交易所/板块」后缀（出现在末段）。用于把 `BRK_B.N` 还原为 `BRK.B`。
+# 只认这些已知后缀，避免把用户输入的类股票点号（`BRK.B` 的 `B`）误当后缀剥掉。
+# 实测本标的池 517 只美股实际只用到 {O(纳斯达克), N(纽交所), BAT(Cboe BZX)}；
+# 其余为容错保留。**刻意不收单字母 A/B/C**——那正是股份类别的写法，收了会把
+# `BRK.A` 剥成 `BRK`（Yahoo 的 A 类行情）。
+_WIND_US_EXCH_SUFFIXES = {"O", "N", "BAT", "OO", "NQ", "OB", "OQ",
+                          "PK", "AM", "GI", "HI"}
+# 判定「末段是交易所后缀」（即已是完整 Wind 代码，无需再反查）
+_WIND_US_EXCH_RE = re.compile(r"\.(?:" + "|".join(sorted(_WIND_US_EXCH_SUFFIXES)) + r")$")
+
+
+def _us_ticker(windcode: str) -> str:
+    """
+    Wind 美股代码 → 内部 ticker（股份类别分隔符统一为点号「.」）
+        AAPL.O  → AAPL
+        BRK_B.N → BRK.B   （Wind 用下划线表示股份类别；Yahoo 用连字符）
+        BRK.B   → BRK.B
+    """
+    code = (windcode or "").strip().upper()
+    parts = code.split(".")
+    if len(parts) >= 2 and parts[-1] in _WIND_US_EXCH_SUFFIXES:
+        parts = parts[:-1]
+    return ".".join(parts).replace("_", ".")
+
+
 def to_internal_symbol(windcode: str, market: str) -> str:
     """
     Wind 带后缀代码 → 项目内部 symbol（与 stocks.py `_detect_market_and_code` 一致）
         0002.HK → 00002   （港股 5 位数字）
         AAPL.O  → AAPL    （美股裸 ticker）
+        BRK_B.N → BRK.B   （美股类股票保留点号，避免与 A 类／同前缀标的撞号）
     """
-    code = (windcode or "").split(".")[0].strip()
     if (market or "").upper() == "HK":
-        return code.zfill(5)
-    return code
+        return (windcode or "").split(".")[0].strip().zfill(5)
+    return _us_ticker(windcode)
 
 
 def to_full_symbol(windcode: str, market: str) -> str:
@@ -143,10 +184,11 @@ def to_yahoo_ticker(windcode: str, market: str) -> str:
     Wind 带后缀代码 → Yahoo Finance ticker
         0002.HK → 0002.HK   （Wind 已是 4 位，与 Yahoo 一致）
         AAPL.O  → AAPL
+        BRK_B.N → BRK-B     （Yahoo 用连字符区分股份类别，写成 BRK 会取到 A 类行情）
     """
     if (market or "").upper() == "HK":
         return (windcode or "").strip()
-    return (windcode or "").split(".")[0].strip()
+    return _us_ticker(windcode).replace(".", "-")
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -160,16 +202,35 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _base_ticker(code: str) -> str:
+    """
+    归一化为可比较的「标的基码」：
+    - 数字代码（港股/A股）：剥后缀并忽略前导零（0002.HK == 00002.HK）
+    - 美股：剥交易所后缀、类股票分隔符统一为点号（BRK_B.N == BRK.B）
+    """
+    c = (code or "").strip().upper()
+    if not c:
+        return ""
+    head, _, _ = c.partition(".")
+    if head.isdigit():
+        return head.lstrip("0") or "0"
+    return _us_ticker(c)
+
+
 def windcode_matches(queried: str, returned: str) -> bool:
     """
     校验 Wind 返回的代码是否确为所查询的标的（防止把「另一家公司」的数据写进来）。
 
-    实测 Wind 自然语言解析器会把**已退市/已失效**的代码模糊匹配回来：
+    实测 Wind 自然语言解析器会把**已退市/已失效/同名前缀**的代码模糊匹配回来：
         AMZN.O → AMAZ.OO  （AMAZING ENE OIL & GAS，前缀相似误配）
         COR.N  → COR!.N   （`!` 是 Wind 的退市标记；DD.N→DD!.N、DOW.N→DOW!.N 同理）
         FOXA.O → TFCFA.O  （21世纪福克斯-A，退市）
+        BRK_B.N → BRK.L   （BRK.B 被解析成 BROOKS MACDONALD，伦敦上市的另一家公司）
     标普500 成分清单里有若干「代码被复用」的标的（COR/DD/DOW/FOX…），
     不校验就会把退市旧实体的财务/基础信息写到当前 symbol 名下。
+
+    ⚠️ 比较必须带上**股份类别**（BRK.B ≠ BRK），否则 `BRK_B.N` 会被 `BRK.L`
+    这类仅共享前缀的返回判为命中。
 
     returned 为空（未返回代码列）时不阻断，交由调用方决定。
     """
@@ -183,13 +244,8 @@ def windcode_matches(queried: str, returned: str) -> bool:
         return False
     if q == r:
         return True
-    q_base, _, _ = q.partition(".")
-    r_base, _, _ = r.partition(".")
-    if q_base == r_base:
-        return True                       # 同一标的，交易所后缀可能不同（.O / .N）
-    if q_base.isdigit() and r_base.isdigit() and q_base.lstrip("0") == r_base.lstrip("0"):
-        return True                       # 港股前导零差异：0002 vs 00002
-    return False
+    qb, rb = _base_ticker(q), _base_ticker(r)
+    return bool(qb) and qb == rb
 
 
 def match_requested(requested: Sequence[str], returned: str) -> Optional[str]:
@@ -229,7 +285,9 @@ class HKUSPreheatService:
         刷新预热标的池 = 指数成分股 ∪ 自选股。
 
         force=False 时，若某指数清单已存在且未超过 UNIVERSE_REFRESH_DAYS，则跳过重查。
-        返回 {来源: 数量} 统计。
+        重查时**会清理已剔除出指数的旧成分**（摘掉该指数来源标签，无其它来源则 enabled=False），
+        避免指数调仓后老成分长期滞留；自选股删除后同样会被摘标签。
+        返回 {来源: enabled 数量} 统计（各分支口径统一）。
         """
         db = get_mongo_db()
         coll = db[UNIVERSE_COLLECTION]
@@ -253,16 +311,20 @@ class HKUSPreheatService:
 
             members = await asyncio.to_thread(self._fetch_index_members, idx_name, meta["market"])
             if not members:
-                logger.warning(f"⚠️ 指数 {idx_name} 未取到任何成分股")
-                stats[source_tag] = 0
+                logger.warning(f"⚠️ 指数 {idx_name} 未取到任何成分股（保留库内旧清单，不清理）")
+                stats[source_tag] = await coll.count_documents(
+                    {"sources": source_tag, "enabled": True})
                 continue
 
             ops = []
             now = datetime.now()
+            keep: List[Tuple[str, str]] = []
             for m in members:
                 wc, name = m["windcode"], m.get("name", "")
+                symbol = to_internal_symbol(wc, meta["market"])
+                keep.append((meta["market"], symbol))
                 ops.append(UpdateOne(
-                    {"market": meta["market"], "symbol": to_internal_symbol(wc, meta["market"])},
+                    {"market": meta["market"], "symbol": symbol},
                     {
                         "$set": {
                             "windcode": wc,
@@ -273,7 +335,7 @@ class HKUSPreheatService:
                             "updated_at": now,
                         },
                         "$setOnInsert": {
-                            "symbol": to_internal_symbol(wc, meta["market"]),
+                            "symbol": symbol,
                             "market": meta["market"],
                             "added_at": now,
                         },
@@ -283,52 +345,82 @@ class HKUSPreheatService:
                 ))
             if ops:
                 await coll.bulk_write(ops, ordered=False)
-            stats[source_tag] = len(members)
-            logger.info(f"✅ 指数 {idx_name} 成分股写入 {len(members)} 只")
+            removed = await self._prune_source(coll, source_tag, keep)
+            n = await coll.count_documents({"sources": source_tag, "enabled": True})
+            stats[source_tag] = n
+            logger.info(f"✅ 指数 {idx_name} 成分股写入 {len(members)} 只"
+                        f"（调仓剔除 {removed} 只，现 {n} 只）")
 
         # ---- 2. 自选股并集 ----
-        fav_count = await self._merge_favorites(coll)
+        fav_count, fav_keys = await self._merge_favorites(coll)
         stats["favorite"] = fav_count
+        removed_fav = await self._prune_source(coll, "favorite", fav_keys)
+        if removed_fav:
+            logger.info(f"🧹 自选股移除后摘除 {removed_fav} 只")
+
+        # ---- 3. 美股自选股补全 Wind 交易所后缀（否则 Wind 侧静默失效）----
+        resolved = await self._resolve_us_windcodes(coll)
+        if resolved:
+            stats["us_windcode_resolved"] = resolved
 
         total = await coll.count_documents({"enabled": True})
         stats["total"] = total
         logger.info(f"📊 Universe 刷新完成，合计 {total} 只：{stats}")
         return stats
 
-    async def _index_fresh(self, coll, source_tag: str, days: int) -> bool:
-        """判断某指数清单是否新鲜（存在且有更新记录、且未超过 days 天）"""
-        doc = await coll.find_one({"sources": source_tag}, {"updated_at": 1}, sort=[("updated_at", -1)])
-        if not doc or not doc.get("updated_at"):
-            return False
-        updated = doc["updated_at"]
-        if isinstance(updated, str):
-            try:
-                updated = datetime.fromisoformat(updated)
-            except ValueError:
-                return False
-        return (datetime.now() - updated) < timedelta(days=days)
+    async def _prune_source(self, coll, source_tag: str,
+                            keep: Sequence[Tuple[str, str]]) -> int:
+        """
+        摘掉「仍带该来源标签、但已不在最新清单里」的标的。
 
-    async def _merge_favorites(self, coll) -> int:
+        摘完后若该标的再无任何来源，则置 `enabled=False`（不再参与取数）；
+        仍被其它指数/自选引用的只摘标签，不影响其继续预热。
+        返回被清理的标的数。
+        """
+        keep_set = set(keep)
+        now = datetime.now()
+        ops = []
+        async for d in coll.find({"sources": source_tag},
+                                 {"_id": 1, "sources": 1, "market": 1, "symbol": 1}):
+            if (d.get("market"), d.get("symbol")) in keep_set:
+                continue
+            remaining = [s for s in (d.get("sources") or []) if s != source_tag]
+            update: Dict[str, Any] = {
+                "$pull": {"sources": source_tag},
+                "$set": {"updated_at": now},
+            }
+            if not remaining:
+                update["$set"]["enabled"] = False
+            ops.append(UpdateOne({"_id": d["_id"]}, update))
+        if ops:
+            await coll.bulk_write(ops, ordered=False)
+        return len(ops)
+
+    async def _merge_favorites(self, coll) -> Tuple[int, List[Tuple[str, str]]]:
         """
         把 users.favorite_stocks 里的港美股自选股并入 universe。
 
         注意：自选股存储为 `users` 集合的内嵌数组（非独立集合），
         字段含 `stock_code` / `stock_name` / `market`。
+        美股此刻只有裸 ticker（`AAPL` / `BRK.B`），交易所后缀由
+        `_resolve_us_windcodes()` 在 refresh 收尾时统一反查补全。
+        返回 (并入条数, [(market, symbol)] 键集) 供清理旧自选使用。
         """
         db = get_mongo_db()
         ops = []
         now = datetime.now()
         seen = 0
+        keys: List[Tuple[str, str]] = []
         async for user in db.users.find({}, {"favorite_stocks": 1}):
             for fav in (user.get("favorite_stocks") or []):
                 market = _FAVORITE_MARKET_MAP.get(str(fav.get("market") or "").strip().lower()) \
                     or _FAVORITE_MARKET_MAP.get(str(fav.get("market") or "").strip())
                 if not market:
                     continue  # 只处理港美股；A 股由既有 favorites_data_sync 负责
-                raw_code = str(fav.get("stock_code") or "").strip()
+                raw_code = str(fav.get("stock_code") or "").strip().upper()
                 if not raw_code:
                     continue
-                # 自选股存的是内部格式（00700 / AAPL），补出 Wind 格式
+                # 自选股存的是内部格式（00700 / AAPL / BRK.B），补出 Wind 格式
                 if market == "HK":
                     # 港股 Wind 用 4 位（00700 → 0700.HK）
                     digits = re.sub(r"\D", "", raw_code)
@@ -336,6 +428,7 @@ class HKUSPreheatService:
                 else:
                     windcode = raw_code
                 symbol = to_internal_symbol(windcode, market)
+                keys.append((market, symbol))
                 ops.append(UpdateOne(
                     {"market": market, "symbol": symbol},
                     {
@@ -358,7 +451,117 @@ class HKUSPreheatService:
         if ops:
             await coll.bulk_write(ops, ordered=False)
         logger.info(f"⭐ 自选股并入 {seen} 条（去重后见 universe 统计）")
-        return seen
+        return seen, keys
+
+    # ---------- 美股自选股：交易所后缀反查 ----------
+
+    async def _resolve_us_windcodes(self, coll) -> int:
+        """
+        为缺少交易所后缀的美股标的补全 Wind 代码（`AAPL` → `AAPL.O`）。
+
+        Wind 的基础信息/财务/日线接口都要求带后缀，裸 ticker 会静默失效
+        （财务永远失败、基础信息每次多打一次无效调用）。此处用 Wind 反查一次，
+        并**过 `windcode_matches` 校验**；        查不到、或返回的其实是另一家公司
+        （如 `BRK.B` 被 Wind 解析成伦敦上市的 `BRK.L`）时打标 `yahoo_only`，
+        由取数链路跳过 Wind，避免白打无效调用与误写他司数据。
+        返回成功补全的标的数。
+
+        说明：判定「待补全」的标准是**末段不是已知交易所后缀**
+        （`AAPL`、`BRK.B` 都算；`AAPL.O`、`BRK_B.N` 不算），
+        所以补全成功后会自动退出待办；始终无法确认的代码每次刷新会重试一次
+        （数量极少，且 Wind 后续补齐覆盖后可自愈）。
+        """
+        pending = [d async for d in coll.find(
+            {"market": "US", "enabled": True,
+             "windcode": {"$not": _WIND_US_EXCH_RE}},
+            {"_id": 1, "symbol": 1, "windcode": 1})]
+        if not pending:
+            return 0
+
+        # 反查用下划线表示股份类别（BRK.B → BRK_B，Wind 的书写方式）
+        pairs = [(d["symbol"], (d.get("windcode") or d["symbol"]).replace(".", "_"))
+                 for d in pending]
+        batch = int(settings.HK_US_PREHEAT_WIND_BATCH_SIZE or 40)
+        resolved_map: Dict[str, str] = {}
+        for chunk in self._chunks(pairs, batch):
+            resolved_map.update(
+                await asyncio.to_thread(self._resolve_us_windcodes_batch, chunk))
+        # 多代码查询时 Wind 偶尔只回其中一只 → 未覆盖的逐个兜底重试（数量极少）
+        for symbol, wc_query in pairs:
+            if symbol in resolved_map:
+                continue
+            resolved_map.update(await asyncio.to_thread(
+                self._resolve_us_windcodes_batch, [(symbol, wc_query)]))
+
+        now = datetime.now()
+        ops = []
+        n_resolved = 0
+        for d in pending:
+            wc = resolved_map.get(d["symbol"])
+            if wc:
+                n_resolved += 1
+                ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {
+                    "windcode": wc,
+                    "yahoocode": to_yahoo_ticker(wc, "US"),
+                    "full_symbol": to_full_symbol(wc, "US"),
+                    "yahoo_only": False,
+                    "updated_at": now,
+                }}))
+            else:
+                # Wind 无法确认该代码 → 只走 Yahoo（数据缺失好过写错公司）
+                ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {
+                    "yahoocode": to_yahoo_ticker(d.get("windcode") or d["symbol"], "US"),
+                    "yahoo_only": True,
+                    "updated_at": now,
+                }}))
+        if ops:
+            await coll.bulk_write(ops, ordered=False)
+        logger.info(f"🔎 美股 Wind 代码补全 {n_resolved}/{len(pending)} 只"
+                    f"（其余 {len(pending) - n_resolved} 只标记 yahoo_only）")
+        return n_resolved
+
+    def _resolve_us_windcodes_batch(
+            self, pairs: List[Tuple[str, str]]) -> Dict[str, str]:
+        """pairs: [(symbol, wind_query_code)] → {symbol: 校验通过的 Wind 代码}"""
+        if not pairs:
+            return {}
+        q = "查询" + "、".join(c for _, c in pairs) + "的证券简称"
+        try:
+            df = self._wind_client().call_table(
+                "stock_data", "get_stock_basicinfo", {"question": q})
+        except Exception as e:
+            logger.warning(f"⚠️ 美股 Wind 代码反查失败（{len(pairs)} 只）: {e}")
+            return {}
+        if df is None or getattr(df, "empty", True):
+            return {}
+        code_col = next((c for c in ("Wind代码", "代码", "windcode") if c in df.columns), None)
+        if not code_col:
+            return {}
+        out: Dict[str, str] = {}
+        for _, row in df.iterrows():
+            ret = str(row.get(code_col) or "").strip()
+            if not ret or ret in ("None", "nan"):
+                continue
+            for symbol, wc_query in pairs:
+                if symbol in out:
+                    continue
+                if windcode_matches(wc_query, ret):
+                    out[symbol] = ret
+                    break
+        return out
+
+    async def _index_fresh(self, coll, source_tag: str, days: int) -> bool:
+        """判断某指数清单是否新鲜（存在且有更新记录、且未超过 days 天）"""
+        doc = await coll.find_one({"sources": source_tag}, {"updated_at": 1}, sort=[("updated_at", -1)])
+        if not doc or not doc.get("updated_at"):
+            return False
+        updated = doc["updated_at"]
+        if isinstance(updated, str):
+            try:
+                updated = datetime.fromisoformat(updated)
+            except ValueError:
+                return False
+        return (datetime.now() - updated) < timedelta(days=days)
 
     # ---------- 指数成分股反查（含递归分批） ----------
 
@@ -481,7 +684,8 @@ class HKUSPreheatService:
                     stats["skipped"] += 1
                     continue
                 items, source = await self._fetch_kline(
-                    t["windcode"], market, t["yahoocode"], limit)
+                    t["windcode"], market, t["yahoocode"], limit,
+                    yahoo_only=bool(t.get("yahoo_only")))
                 if not items:
                     stats["failed"] += 1
                     stats["failed_symbols"].append(f"{market}:{symbol}")
@@ -510,8 +714,11 @@ class HKUSPreheatService:
                                 lookback: int,
                                 force_full: bool = False) -> Dict[str, Any]:
         """
-        批量日线同步：先逐只算增量窗口 → 按市场汇总统一时间窗 → 分批 yf.download
+        批量日线同步：先逐只算增量窗口 → 按市场汇总统一时间窗 → **按 chunk 下载并即时写库**
         → 逐只按「> 库内最新 trade_date」过滤后再幂等 upsert。
+
+        内存上按 chunk 流式处理（下载一批 → 写库 → 释放），峰值只与 `BATCH_SIZE` 相关，
+        不会随标的数增长而常驻全市场数万行。
 
         force_full=True 时跳过「> 最新交易日」过滤并按完整窗口重算涨跌（重建历史深度）。
         Yahoo 无数据的标的自动回退 Wind 单只；仍无数据才计入失败清单。
@@ -534,7 +741,8 @@ class HKUSPreheatService:
             if limit <= 0:
                 stats["skipped"] += 1
                 continue
-            plan.append({"t": t, "coll": coll, "last": last, "limit": limit})
+            plan.append({"t": t, "coll": coll, "last": last,
+                         "limit": limit, "lookback": lookback})
 
         if not plan:
             stats["elapsed"] = round((datetime.now() - started).total_seconds(), 1)
@@ -544,7 +752,7 @@ class HKUSPreheatService:
         chunk_size = int(settings.HK_US_PREHEAT_BATCH_SIZE or 60)
         sleep_s = float(settings.HK_US_PREHEAT_BATCH_SLEEP_SECONDS or 0)
 
-        # 2. 按市场分批下载
+        # 2. 按市场分批下载；每批下载完立即写库并释放，避免整市场行常驻内存
         for mk in ("HK", "US"):
             group = [p for p in plan if p["t"]["market"] == mk]
             if not group:
@@ -553,136 +761,161 @@ class HKUSPreheatService:
             # 统一时间窗 = 覆盖本组最早需要的起点（后续逐只再裁）
             end_day = date.today() + timedelta(days=1)
             start_day = min(end_day - timedelta(days=p["limit"] + 10) for p in group)
+            s_day, e_day = start_day.strftime("%Y-%m-%d"), end_day.strftime("%Y-%m-%d")
 
+            # yahoocode 缺失的标的（如美股自选股未补全后缀）直接走 Wind 兜底
+            by_ticker: Dict[str, Dict[str, Any]] = {}
             tickers: List[str] = []
+            no_yahoo: List[Dict[str, Any]] = []
             for p in group:
                 tk = p["t"].get("yahoocode") or ""
-                if tk and tk not in tickers:
+                if not tk:
+                    no_yahoo.append(p)
+                elif tk in by_ticker:
+                    no_yahoo.append(p)          # ticker 撞号（异常数据），退化为 Wind
+                else:
+                    by_ticker[tk] = p
                     tickers.append(tk)
 
+            for p in no_yahoo:
+                await self._write_daily_target(p, [], stats, force_full)
+
+            if not tickers:
+                continue
+            chunks = self._chunks(tickers, chunk_size)
             logger.info(f"  ⬇️ [{mk}] Yahoo 批量下载 {len(tickers)} 只"
-                        f"（{start_day} ~ {end_day}，{chunk_size} 只/批，共 "
-                        f"{-(-len(tickers)//chunk_size)} 批）…")
-            data_map = await asyncio.to_thread(
-                self._yahoo_batch, tickers, start_day, end_day, chunk_size, sleep_s)
-            logger.info(f"  ✅ [{mk}] Yahoo 有数据 {len(data_map)}/{len(tickers)} 只，开始写库…")
+                        f"（{s_day} ~ {e_day}，{chunk_size} 只/批，共 {len(chunks)} 批）…")
 
-            # 3. 逐只过滤 + 写库
-            for i, p in enumerate(group, 1):
-                t, coll, last = p["t"], p["coll"], p["last"]
-                symbol = t["symbol"]
+            for ci, chunk in enumerate(chunks, 1):
+                got: Dict[str, List[Dict[str, Any]]] = {}
                 try:
-                    raw = data_map.get(t.get("yahoocode") or "") or []
-                    rows_written = 0
-                    used: Optional[str] = None
-
-                    # (a) Yahoo 覆盖过薄（上游缺口）→ 试用 Wind 补齐，谁多听谁。
-                    #     按**完整 lookback** 取 Wind（而非增量小窗口），否则补不全；
-                    #     且只在「Wind 行数 > Yahoo 行数 且 > 库内现有行数」时切换，
-                    #     保证任何情况下都不会让已存历史变短。
-                    if len(raw) < _MIN_YAHOO_ROWS:
-                        existing = await coll.count_documents({"symbol": symbol})
-                        w_items = await asyncio.to_thread(
-                            self._wind_kline, t["windcode"], max(p["limit"], lookback))
-                        if w_items and len(w_items) > max(len(raw), existing):
-                            rows_written = await self._write_single_source(
-                                coll, t, w_items, "wind", from_scratch=True)
-                            used = "wind"
-
-                    if used is None:
-                        new_rows = raw if force_full else \
-                            [it for it in raw if not last or (it.get("date") or "") > last]
-                        if new_rows:
-                            rows_written = await self._upsert_daily(
-                                coll, new_rows, t, "yahoo", from_scratch=force_full)
-                            used = "yahoo"
-                        elif raw:
-                            # Yahoo 有历史数据但无新增（已是库内最新）
-                            stats["skipped"] += 1
-                        else:
-                            # (b) Yahoo 完全没数据 → Wind 单只兜底
-                            w_items = await asyncio.to_thread(
-                                self._wind_kline, t["windcode"], p["limit"])
-                            if w_items and last and not force_full:
-                                w_items = [it for it in w_items
-                                           if (it.get("date") or "") > last]
-                            if w_items:
-                                rows_written = await self._write_single_source(
-                                    coll, t, w_items, "wind", from_scratch=force_full)
-                                used = "wind"
-                            elif last and not force_full:
-                                stats["skipped"] += 1
-                            else:
-                                stats["failed"] += 1
-                                stats["failed_symbols"].append(f"{mk}:{symbol}")
-
-                    if used:
-                        stats["rows"] += rows_written
-                        stats["ok"] += 1
-                        stats["source"][used] += 1
-                except Exception as e:
-                    stats["failed"] += 1
-                    stats["failed_symbols"].append(f"{mk}:{symbol}")
-                    logger.warning(f"⚠️ 日线入库失败 {mk}:{symbol}: {e}")
-
-                if i % 100 == 0:
-                    logger.info(f"  …[{mk}] 已写 {i}/{len(group)}"
+                    got = await asyncio.to_thread(
+                        self._yahoo_download_chunk, chunk, s_day, e_day)
+                except Exception as ex:
+                    logger.warning(f"⚠️ Yahoo 批量下载第 {ci}/{len(chunks)} 批失败"
+                                   f"（{len(chunk)} 只，将逐只回退）: {ex}")
+                # 立即落地本批，随后释放 got
+                for tk in chunk:
+                    target_p = by_ticker.get(tk)
+                    if target_p is not None:
+                        await self._write_daily_target(
+                            target_p, got.get(tk) or [], stats, force_full)
+                got.clear()
+                if sleep_s:
+                    await asyncio.sleep(sleep_s)
+                if ci % 5 == 0 or ci == len(chunks):
+                    logger.info(f"  …[{mk}] Yahoo 进度 {ci}/{len(chunks)} 批"
                                 f"（ok{stats['ok']} skip{stats['skipped']} fail{stats['failed']}）")
 
         stats["elapsed"] = round((datetime.now() - started).total_seconds(), 1)
         logger.info(f"✅ 日线同步完成（批量）: {stats}")
         return stats
 
-    def _yahoo_batch(self, tickers: List[str], start_day: date, end_day: date,
-                     chunk_size: int, sleep_s: float) -> Dict[str, List[Dict[str, Any]]]:
+    async def _write_daily_target(self, p: Dict[str, Any], raw: List[Dict[str, Any]],
+                                  stats: Dict[str, Any], force_full: bool) -> None:
         """
-        分批调用 yf.download，返回 {ticker: [日线 item, ...]}。
+        单只标的落地（批量路径）。raw 为 Yahoo 返回行（可能为空）。
 
-        单批内的 ticker 由 yfinance 自行并发（threads=True），
-        任一只无数据/退市不会影响同批其它标的。
+        决策顺序：
+        (1) Yahoo 覆盖过薄（上游缺口）→ 按**完整 lookback** 用 Wind 补齐，
+            仅当「Wind 行数 > Yahoo 行数 且 > 库内现有行数」才整源切换；
+        (2) 否则过滤出「> 库内最新交易日」的 Yahoo 新增行写库；
+        (3) Yahoo 完全无数据 → Wind 单只兜底。
         """
-        import time as _time
+        t, coll, last = p["t"], p["coll"], p["last"]
+        mk, symbol = t["market"], t["symbol"]
+        # Wind 无法确认该代码时（yahoo_only）不调用 Wind，避免写入他司数据
+        allow_wind = not t.get("yahoo_only")
+        try:
+            rows_written = 0
+            used: Optional[str] = None
+
+            # (1) 覆盖过薄 → 试 Wind 补齐。
+            #     ⚠️ 仅当库内同样覆盖不足时才试：已补齐的标的（如 AVB 已 240 根、Yahoo 恒为 1 根）
+            #     若每次都重试，等于每次同步白打一次完整 lookback 的 Wind。
+            if allow_wind and len(raw) < _MIN_YAHOO_ROWS:
+                existing = await coll.count_documents({"symbol": symbol})
+                if existing < _MIN_YAHOO_ROWS or force_full:
+                    w_items = await asyncio.to_thread(
+                        self._wind_kline, t["windcode"], max(p["limit"], p["lookback"]))
+                    if w_items and len(w_items) > max(len(raw), existing):
+                        rows_written = await self._write_single_source(
+                            coll, t, w_items, "wind", from_scratch=True)
+                        used = "wind"
+
+            if used is None:
+                new_rows = raw if force_full else \
+                    [it for it in raw if not last or (it.get("date") or "") > last]
+                if new_rows:
+                    rows_written = await self._upsert_daily(
+                        coll, new_rows, t, "yahoo", from_scratch=force_full)
+                    used = "yahoo"
+                elif raw:
+                    # Yahoo 有历史数据但无新增（已是库内最新）
+                    stats["skipped"] += 1
+                elif allow_wind:
+                    # (3) Yahoo 完全没数据 → Wind 单只兜底
+                    w_items = await asyncio.to_thread(
+                        self._wind_kline, t["windcode"], p["limit"])
+                    if w_items and last and not force_full:
+                        w_items = [it for it in w_items
+                                   if (it.get("date") or "") > last]
+                    if w_items:
+                        rows_written = await self._write_single_source(
+                            coll, t, w_items, "wind", from_scratch=force_full)
+                        used = "wind"
+                    elif last and not force_full:
+                        stats["skipped"] += 1
+                    else:
+                        stats["failed"] += 1
+                        stats["failed_symbols"].append(f"{mk}:{symbol}")
+                elif last and not force_full:
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+                    stats["failed_symbols"].append(f"{mk}:{symbol}")
+
+            if used:
+                stats["rows"] += rows_written
+                stats["ok"] += 1
+                stats["source"][used] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            stats["failed_symbols"].append(f"{mk}:{symbol}")
+            logger.warning(f"⚠️ 日线入库失败 {mk}:{symbol}: {e}")
+
+    def _yahoo_download_chunk(self, chunk: List[str], s_day: str,
+                              e_day: str) -> Dict[str, List[Dict[str, Any]]]:
+        """下载**单批** ticker 的日线，返回 {ticker: [item, ...]}（内存只驻留本批）"""
         import yfinance as yf
 
         out: Dict[str, List[Dict[str, Any]]] = {}
-        s = start_day.strftime("%Y-%m-%d")
-        e = end_day.strftime("%Y-%m-%d")
-        chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+        try:
+            df = yf.download(
+                chunk, start=s_day, end=e_day, auto_adjust=False,
+                group_by="ticker", threads=True, progress=False, timeout=30)
+        except Exception as ex:
+            logger.warning(f"⚠️ Yahoo 批量下载失败（{len(chunk)} 只）: {ex}")
+            return out
+        if df is None or df.empty:
+            return out
 
-        for idx, chunk in enumerate(chunks, 1):
-            try:
-                df = yf.download(
-                    chunk, start=s, end=e, auto_adjust=False,
-                    group_by="ticker", threads=True, progress=False, timeout=30)
-            except Exception as ex:
-                logger.warning(f"⚠️ Yahoo 批量下载第 {idx}/{len(chunks)} 批失败"
-                               f"（{len(chunk)} 只，将逐只回退）: {ex}")
-                df = None
-
-            if df is not None and not df.empty:
-                try:
-                    is_multi = getattr(df.columns, "nlevels", 1) > 1
-                    if is_multi:
-                        level0 = set(df.columns.get_level_values(0))
-                        for tk in chunk:
-                            if tk not in level0:
-                                continue
-                            rows = self._yahoo_frame_to_items(df[tk])
-                            if rows:
-                                out[tk] = rows
-                    elif len(chunk) == 1:
-                        rows = self._yahoo_frame_to_items(df)
-                        if rows:
-                            out[chunk[0]] = rows
-                except Exception as ex:
-                    logger.warning(f"⚠️ Yahoo 批量结果解析失败（第 {idx} 批）: {ex}")
-
-            if sleep_s:
-                _time.sleep(sleep_s)
-            if idx % 5 == 0 or idx == len(chunks):
-                logger.info(f"  …Yahoo 下载进度 {idx}/{len(chunks)} 批，累计有数据 "
-                            f"{len(out)}/{len(tickers)} 只")
-
+        try:
+            is_multi = getattr(df.columns, "nlevels", 1) > 1
+            if is_multi:
+                level0 = set(df.columns.get_level_values(0))
+                for tk in chunk:
+                    if tk not in level0:
+                        continue
+                    rows = self._yahoo_frame_to_items(df[tk])
+                    if rows:
+                        out[tk] = rows
+            elif len(chunk) == 1:
+                rows = self._yahoo_frame_to_items(df)
+                if rows:
+                    out[chunk[0]] = rows
+        except Exception as ex:
+            logger.warning(f"⚠️ Yahoo 批量结果解析失败（{len(chunk)} 只）: {ex}")
         return out
 
     @staticmethod
@@ -735,6 +968,9 @@ class HKUSPreheatService:
                     "symbol": d.get("symbol"),
                     "windcode": d.get("windcode"),
                     "yahoocode": d.get("yahoocode") or d.get("windcode"),
+                    # True 表示 Wind 无法确认该代码（如 BRK.B 会被解析成另一家公司），
+                    # 取数链路应跳过 Wind，只用 Yahoo。
+                    "yahoo_only": bool(d.get("yahoo_only")),
                 })
         return out
 
@@ -775,10 +1011,18 @@ class HKUSPreheatService:
     # ---------- 双源取数 ----------
 
     async def _fetch_kline(self, windcode: str, market: str, yahoocode: str,
-                           limit: int) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-        """主备双源取日线：默认 Yahoo 主 / Wind 备（由配置决定顺序）"""
+                           limit: int, yahoo_only: bool = False,
+                           ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        """
+        主备双源取日线：默认 Yahoo 主 / Wind 备（由配置决定顺序）。
+
+        yahoo_only=True（Wind 无法确认该代码）时只用 Yahoo，避免把别家公司的
+        行情当成该标的写进来。
+        """
         primary = (settings.HK_US_PREHEAT_PRIMARY_SOURCE or "yahoo").strip().lower()
         order = ["wind", "yahoo"] if primary == "wind" else ["yahoo", "wind"]
+        if yahoo_only:
+            order = [s for s in order if s == "yahoo"] or ["yahoo"]
 
         for src in order:
             try:
@@ -852,9 +1096,17 @@ class HKUSPreheatService:
         """
         幂等写入日线（唯一键 symbol+trade_date+data_source+period）。
 
+        ⚠️ 唯一键含 `data_source`，而 K 线接口只按 `{symbol, period}` 过滤，
+        所以同一交易日若同时存在 Yahoo 与 Wind 两行，接口会返回**重复交易日**。
+        因此写入前先按本次写入的 `trade_date` **精确**清除其它来源的旧行：
+        既消除重复，又不会误删本次未覆盖的历史（历史永不缩短）。
+
         from_scratch=True 时不读取库内最近收盘作为首日前收，而是从本批第一根 K 线
         重新起算 pre_close/change/pct_chg（用于 force_full 重建完整历史）。
         """
+        items = [it for it in items if it.get("date") and _to_float(it.get("close")) is not None]
+        if not items:
+            return 0
         now = datetime.now()
         prev_close = None
         if not from_scratch:
@@ -862,11 +1114,25 @@ class HKUSPreheatService:
                                        sort=[("trade_date", -1)])
             if last:
                 prev_close = _to_float(last.get("close"))
+        await self._purge_conflicting_dates(coll, target["symbol"], source, items)
         ops = self._build_daily_ops(items, target, source, prev_close, now)
         if not ops:
             return 0
         res = await coll.bulk_write(ops, ordered=False)
         return (res.upserted_count or 0) + (res.modified_count or 0)
+
+    @staticmethod
+    async def _purge_conflicting_dates(coll, symbol: str, source: str,
+                                       items: List[Dict[str, Any]]) -> None:
+        """删除本次写入日期上「其它数据来源」的旧行，避免同交易日重复记录"""
+        dates = sorted({str(it.get("date")) for it in items if it.get("date")})
+        if not dates:
+            return
+        await coll.delete_many({
+            "symbol": symbol,
+            "data_source": {"$ne": source},
+            "trade_date": {"$in": dates},
+        })
 
     async def _write_single_source(self, coll, target: Dict[str, str],
                                    items: List[Dict[str, Any]], source: str,
@@ -989,9 +1255,13 @@ class HKUSPreheatService:
 
     async def _collect_basic_info(self, targets: List[Dict[str, str]],
                                   batch_size: int, stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """按批拉取基础信息，返回 {windcode: info}"""
+        """按批拉取基础信息，返回 {windcode: info}（yahoo_only 标的不参与 Wind 批量）"""
         info_map: Dict[str, Dict[str, Any]] = {}
-        for chunk in self._chunks(targets, batch_size):
+        wind_targets = [t for t in targets if not t.get("yahoo_only")]
+        skipped = len(targets) - len(wind_targets)
+        if skipped:
+            logger.info(f"  ⏭️ 基础信息跳过 Wind 批量 {skipped} 只（标记 yahoo_only）")
+        for chunk in self._chunks(wind_targets, batch_size):
             got = await asyncio.to_thread(
                 self._fetch_basic_batch, [t["windcode"] for t in chunk])
             info_map.update(got)
@@ -1003,7 +1273,7 @@ class HKUSPreheatService:
     async def _retry_missing_basic(self, targets: List[Dict[str, str]],
                                    info_map: Dict[str, Dict[str, Any]],
                                    stats: Dict[str, Any]) -> None:
-        """批量未覆盖的代码逐只兜底重试"""
+        """批量未覆盖的代码逐只兜底重试（yahoo_only 直接走 Yahoo）"""
         missing = [t for t in targets if t["windcode"] not in info_map]
         if not missing:
             return
@@ -1011,9 +1281,11 @@ class HKUSPreheatService:
             logger.warning(f"⚠️ 基础信息批量命中率偏低（缺 {len(missing)}/{len(targets)}），"
                            f"判定 Wind 批量查询异常，逐只兜底重试…")
         for t in missing:
-            info = await asyncio.to_thread(self._fetch_basic_info, t)
+            info = None
+            if not t.get("yahoo_only"):
+                info = await asyncio.to_thread(self._fetch_basic_info, t)
             if not info:
-                # Wind 无有效命中（含代码误配到退市旧实体）→ Yahoo 兜底
+                # Wind 无有效命中（含代码误配到退市旧实体 / Wind 不认识该代码）→ Yahoo 兜底
                 info = await asyncio.to_thread(self._fetch_basic_info_yahoo, t)
             if info:
                 info_map[t["windcode"]] = info
@@ -1088,7 +1360,9 @@ class HKUSPreheatService:
         }
 
     def _fetch_basic_info(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """单只兜底：Wind 查询基础信息（含代码匹配校验）"""
+        """单只兜底：Wind 查询基础信息（含代码匹配校验；yahoo_only 直接放弃 Wind）"""
+        if target.get("yahoo_only"):
+            return None
         try:
             df = self._wind_client().call_table(
                 "stock_data", "get_stock_basicinfo",
@@ -1168,6 +1442,8 @@ class HKUSPreheatService:
         rec_map = await self._collect_financial(targets, batch_size, stats)
         missing = [t for t in targets if t["windcode"] not in rec_map]
         for t in missing:
+            if t.get("yahoo_only"):
+                continue  # Wind 无法确认该代码，财务无第二来源（宁缺勿错）
             rec = await asyncio.to_thread(self._fetch_financial, t)
             if rec:
                 rec_map[t["windcode"]] = rec
@@ -1208,9 +1484,13 @@ class HKUSPreheatService:
 
     async def _collect_financial(self, targets: List[Dict[str, str]],
                                  batch_size: int, stats: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """按批拉取财务，返回 {windcode: rec}"""
+        """按批拉取财务，返回 {windcode: rec}（yahoo_only 标的不参与 Wind 批量）"""
         rec_map: Dict[str, Dict[str, Any]] = {}
-        for chunk in self._chunks(targets, batch_size):
+        wind_targets = [t for t in targets if not t.get("yahoo_only")]
+        skipped = len(targets) - len(wind_targets)
+        if skipped:
+            logger.info(f"  ⏭️ 财务跳过 Wind 批量 {skipped} 只（标记 yahoo_only）")
+        for chunk in self._chunks(wind_targets, batch_size):
             got = await asyncio.to_thread(
                 self._fetch_financial_batch, [t["windcode"] for t in chunk])
             rec_map.update(got)
@@ -1291,7 +1571,9 @@ class HKUSPreheatService:
         }
 
     def _fetch_financial(self, target: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """单只兜底：Wind 查询财务（含代码匹配校验，拒收退市旧实体）"""
+        """单只兜底：Wind 查询财务（含代码匹配校验，拒收退市旧实体；yahoo_only 放弃 Wind）"""
+        if target.get("yahoo_only"):
+            return None
         wc = target["windcode"]
         try:
             df = self._wind_client().call_table(

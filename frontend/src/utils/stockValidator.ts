@@ -127,6 +127,16 @@ export function validateHKStock(code: string): StockValidationResult {
 }
 
 /**
+ * 判断是否为「疑似缺位的 6 位 A股/ETF 代码」
+ * 例：51005（510050 少写一位）、15991（159919 少写一位）
+ * 这类 5 位数字很可能是笔误，不应被静默当成港股接受
+ */
+export function looksLikeTruncatedCNCode(code: string): boolean {
+  const cleanCode = code.trim().replace(/[^0-9]/g, '')
+  return /^[15]\d{4}$/.test(cleanCode)
+}
+
+/**
  * 自动识别股票代码格式并验证
  * @param code 股票代码
  * @param marketHint 市场提示（可选），如果提供则优先验证该市场
@@ -181,6 +191,14 @@ export function validateStockCode(
   
   // 1-5位数字 -> 港股（00700 腾讯、09988 阿里，也接受 700、9988）
   if (cleanCode.length <= 5) {
+    // ⚠️ 5 位且以 1/5 开头更像 6 位 A股/ETF 代码少写一位（51005 ↔ 510050），
+    // 不再静默当成港股，改为提示补位以免误走港股链路取不到数据
+    if (looksLikeTruncatedCNCode(cleanCode)) {
+      return {
+        valid: false,
+        message: '疑似 A股/ETF 代码缺位（如 510050 写成了 51005）；港股代码通常以 0 开头'
+      }
+    }
     return validateHKStock(cleanCode)
   }
   
