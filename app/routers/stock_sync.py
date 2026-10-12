@@ -844,12 +844,13 @@ async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
             elif request.data_source == "akshare":
                 db = get_mongo_db()
                 symbol6 = str(request.symbol).zfill(6)
+                placeholder_name = f"股票{symbol6}"
 
                 existing_stock = await db.stock_basic_info.find_one(
                     {"code": symbol6},
                     {"name": 1}
                 )
-                fallback_name = existing_stock.get("name") if existing_stock and existing_stock.get("name") else f"股票{symbol6}"
+                fallback_name = existing_stock.get("name") if existing_stock and existing_stock.get("name") else placeholder_name
 
                 service = await get_akshare_sync_service()
                 from app.services.official_industry_service import (
@@ -873,7 +874,7 @@ async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
                     else:
                         basic_data = basic_info
 
-                    if basic_data.get("name") == f"股票{symbol6}" and fallback_name != f"股票{symbol6}":
+                    if basic_data.get("name") == placeholder_name and fallback_name != placeholder_name:
                         basic_data["name"] = fallback_name
                         logger.debug(f"📝 使用数据库中的股票名称: {fallback_name}")
 
@@ -895,24 +896,31 @@ async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
                     basic_data["source"] = "akshare"
                     basic_data["updated_at"] = datetime.utcnow().isoformat()
 
-                    await db.stock_basic_info.update_one(
-                        {"code": symbol6, "source": "akshare"},
-                        {"$set": basic_data},
-                        upsert=True
-                    )
-
-                    if degraded_sync:
+                    # 🚫 占位/降级结果一律不落库。
+                    # 降级结果除 code/symbol/占位名外不含任何真实信息，写进去只会污染
+                    # `stock_basic_info`：曾因此写出 {code:'003669', name:'股票003669',
+                    # sync_status:'degraded'} 脏行（旧脏值 003669 被当成 A 股走本分支）。
+                    # 结果为「失败」，与旧行为一致；区别只是不再产生占位记录。
+                    has_real_name = str(basic_data.get("name") or "").strip() not in ("", placeholder_name)
+                    if degraded_sync or not has_real_name:
+                        reason = detail_fetch_error or "AKShare 未返回有效基础信息（仅占位数据）"
                         result["basic_sync"] = {
                             "success": False,
-                            "degraded": True,
-                            "message": "基础数据已降级写入，AKShare 个股详情接口失败",
-                            "error": detail_fetch_error or "AKShare 个股详情接口失败",
+                            "degraded": bool(degraded_sync),
+                            "skipped_write": True,
+                            "message": "未获取到有效基础数据，已跳过写库（不产生占位记录）",
+                            "error": reason,
                             "detail_symbol": detail_fetch_symbol,
                         }
                         logger.warning(
-                            f"⚠️ {request.symbol} 基础数据仅完成降级同步 (AKShare): {detail_fetch_error or '个股详情接口失败'}"
+                            f"⚠️ {request.symbol} 基础数据无效（{reason}），已跳过写库以避免占位记录"
                         )
                     else:
+                        await db.stock_basic_info.update_one(
+                            {"code": symbol6, "source": "akshare"},
+                            {"$set": basic_data},
+                            upsert=True
+                        )
                         result["basic_sync"] = {
                             "success": True,
                             "message": "基础数据同步成功"

@@ -174,7 +174,13 @@ class AKShareSyncService:
     def _build_basic_info_from_list(
         self, code: str, name: str, industry: str = ""
     ) -> Dict[str, Any]:
-        """从股票列表 + 行业构建基础信息（避免 AKShare 轮询查询行业导致封号）"""
+        """
+        从股票列表 + 行业构建基础信息（避免 AKShare 轮询查询行业导致封号）
+
+        注意：不在此处伪造占位名（旧实现为 `name or f"股票{code6}"`）。名称缺失时
+        留空，由 `_process_basic_info_batch` 的守卫判定并**拒绝写库**——否则会向
+        `stock_basic_info` 写入 `name == "股票<code>"` 的脏行。
+        """
         from datetime import datetime, timezone
         code6 = str(code).strip().zfill(6)
         market = "主板"
@@ -191,7 +197,7 @@ class AKShareSyncService:
         return {
             "code": code6,
             "symbol": code6,
-            "name": name or f"股票{code6}",
+            "name": str(name or "").strip(),
             "industry": industry or "未知",
             "area": "",
             "market": market,
@@ -268,6 +274,21 @@ class AKShareSyncService:
                     # 🔥 确保 symbol 字段存在
                     if "symbol" not in basic_data:
                         basic_data["symbol"] = code6
+
+                    # 🚫 占位/降级结果不落库：`name` 为空或为「股票<code>」占位，
+                    # 或标记 degraded，说明没有拿到任何可识别的真实字段，写库只会
+                    # 向 stock_basic_info 灌脏行（与单股同步侧同一道守卫）。
+                    resolved_name = str(basic_data.get("name") or "").strip()
+                    if basic_data.get("sync_status") == "degraded" \
+                            or resolved_name in ("", f"股票{code6}"):
+                        batch_stats["error_count"] += 1
+                        batch_stats["errors"].append({
+                            "code": code,
+                            "error": "未获取到有效基础信息（仅占位数据），已跳过写库",
+                            "context": "placeholder_guard",
+                        })
+                        logger.warning(f"⚠️ {code} 基础信息无效（名称缺失/占位），已跳过写库")
+                        continue
 
                     # 更新到数据库（使用 code + source 联合查询）
                     try:
