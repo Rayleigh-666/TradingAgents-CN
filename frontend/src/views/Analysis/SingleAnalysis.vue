@@ -1596,7 +1596,7 @@ const submitAnalysis = async () => {
 
   // 🔥 分析前预检：检查数据源配置、基础数据同步状态
   try {
-    const precheckResp = await analysisApi.precheck(analysisForm.symbol)
+    const precheckResp = await analysisApi.precheck(analysisForm.symbol, toApiMarketType(analysisForm.market))
     const precheck = precheckResp.data || precheckResp
     if (!precheck.can_submit) {
       // 阻止提交，引导用户先完成配置/同步

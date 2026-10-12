@@ -134,8 +134,12 @@ export const analysisApi = {
   },
 
   // 分析前预检：检查数据源配置、基础数据同步状态
-  precheck(symbol?: string): Promise<ApiResponse<any>> {
-    const params = symbol ? { symbol } : {}
+  // market_type 决定后端查哪张基础信息表（cn→stock_basic_info / hk / us 各一张），
+  // 漏传会让港股/美股被当成 A 股查而误报「基础数据未同步」。
+  precheck(symbol?: string, marketType?: 'cn' | 'hk' | 'us'): Promise<ApiResponse<any>> {
+    const params: Record<string, string> = {}
+    if (symbol) params.symbol = symbol
+    if (marketType) params.market_type = marketType
     return request.get('/api/analysis/precheck', { params })
   },
 

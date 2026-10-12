@@ -26,6 +26,7 @@ from app.models.analysis import (
 )
 from tradingagents.utils.stock_utils import StockUtils, StockMarket, SecurityType
 from app.core.database import get_mongo_db
+from app.core.market_codes import basic_info_collection, normalize_symbol, resolve_market
 from app.utils.timezone import now_tz
 from bson import ObjectId
 
@@ -438,6 +439,7 @@ _CACHE_SOURCE_TYPES = {"local", "mongodb", "local_file"}
 @router.get("/precheck", response_model=Dict[str, Any])
 async def precheck_analysis(
     symbol: Optional[str] = Query(None, description="待分析的股票代码（可选）"),
+    market_type: str = Query("cn", description="市场类型：cn/hk/us"),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -467,8 +469,12 @@ async def precheck_analysis(
             }
 
         # ── 2. 检查基础数据同步 ──
+        # 🔥 按市场取集合：港股/美股的基础信息落在 stock_basic_info_hk / _us，
+        # 若照旧只数 A 股集合，港股/美股专用部署会被误判为「基础数据尚未同步」。
         db = get_mongo_db()
-        basics_count = await db["stock_basic_info"].count_documents({})
+        market = resolve_market(market_type)
+        basics_coll = basic_info_collection(market)
+        basics_count = await db[basics_coll].count_documents({})
         if basics_count == 0:
             return {
                 "can_submit": False,
@@ -478,28 +484,36 @@ async def precheck_analysis(
                 "details": {
                     "enabled_real_sources": enabled_real_sources,
                     "basics_count": 0,
+                    "market_type": market,
+                    "basics_collection": basics_coll,
                 },
             }
 
         # ── 3. 检查目标股票是否存在（如果传了 symbol） ──
+        # 代码须按市场归一化后再查（港股 5 位码 03669 若补成 6 位会永远查不到），
+        # 且必须查该市场自己的集合——这正是港股点「开始分析」被误拦的原因。
         target_exists = True
+        normalized = None
         if symbol:
-            sym = symbol.strip()
-            # 同时匹配 code 和 symbol 字段
-            query = {"$or": [{"code": sym}, {"symbol": sym}]}
-            doc = await db["stock_basic_info"].find_one(query)
-            target_exists = doc is not None
+            normalized = normalize_symbol(symbol, market)
+            target_exists = False
+            if normalized:
+                query = {"$or": [{"code": normalized}, {"symbol": normalized}]}
+                doc = await db[basics_coll].find_one(query)
+                target_exists = doc is not None
 
         if symbol and not target_exists:
             return {
                 "can_submit": False,
                 "reason": "stock_not_found",
-                "message": f"股票 {symbol} 的基础数据未同步，请先同步该股票数据",
+                "message": f"股票 {normalized or symbol} 的基础数据未同步，请先同步该股票数据",
                 "redirect": "/settings/sync",
                 "details": {
                     "enabled_real_sources": enabled_real_sources,
                     "basics_count": basics_count,
-                    "symbol": symbol,
+                    "symbol": normalized or symbol,
+                    "market_type": market,
+                    "basics_collection": basics_coll,
                 },
             }
 
@@ -511,7 +525,8 @@ async def precheck_analysis(
             "details": {
                 "enabled_real_sources": enabled_real_sources,
                 "basics_count": basics_count,
-                "symbol": symbol,
+                "symbol": normalized or symbol,
+                "market_type": market,
                 "target_exists": target_exists,
             },
         }
