@@ -21,6 +21,7 @@ from app.models.user import PyObjectId
 from app.services.unified_analysis_engine import UnifiedAnalysisEngine
 from app.services.workflow_registry import AnalysisWorkflowRegistry
 from app.core.database import get_mongo_db
+from app.core.market_codes import basic_info_collection, guess_market, normalize_symbol
 from app.utils.timezone import now_tz
 
 logger = logging.getLogger(__name__)
@@ -2118,10 +2119,14 @@ class TaskAnalysisService:
             return ""
         
         try:
-            code_str = str(stock_code).strip().zfill(6)
+            # 按代码形态分流查对应市场的集合：港股 5 位码照旧 zfill(6) 会查错库
+            # （第五轮 Review P3-2）
+            raw = str(stock_code).strip()
+            market = guess_market(raw)
+            code_str = normalize_symbol(raw, market)
 
             if self.db is not None:
-                if _is_cn_etf_symbol(code_str):
+                if market == "cn" and _is_cn_etf_symbol(code_str):
                     etf_doc = await self._find_one_compatible(
                         self.db.etf_basic_info,
                         {"code": code_str},
@@ -2133,7 +2138,7 @@ class TaskAnalysisService:
                             return etf_name
 
                 stock_doc = await self._find_one_compatible(
-                    self.db.stock_basic_info,
+                    self.db[basic_info_collection(market)],
                     {"$or": [{"code": code_str}, {"symbol": code_str}]},
                     {"name": 1, "stock_name": 1, "_id": 0}
                 )

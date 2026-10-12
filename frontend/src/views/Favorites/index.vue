@@ -533,7 +533,7 @@ import {
   type StockSyncTaskStatus,
 } from '@/api/stockSync'
 import { loadManualSyncSourceState, type ManualSyncDataSource } from '@/utils/dataSource'
-import { normalizeMarketForAnalysis } from '@/utils/market'
+import { normalizeMarketForAnalysis, toApiMarketType } from '@/utils/market'
 import { ApiClient } from '@/api/request'
 
 import type { FavoriteItem, FavoritesRealtimeSyncTaskStatus } from '@/api/favorites'
@@ -589,10 +589,13 @@ const singleSyncDialogVisible = ref(false)
 const singleSyncLoading = ref(false)
 const currentSyncStock = ref({
   stock_code: '',
-  stock_name: ''
+  stock_name: '',
+  market: 'A股'
 })
 const singleSyncForm = ref({
-  syncTypes: ['realtime'],  // 默认只选中实时行情（最常用）
+  // 默认同时勾选历史行情：实时行情回填依赖当日日线，若该标的从未同步过历史，
+  // 只勾实时会因「无数据可回填」而必失败（第五轮 Review P3-5）
+  syncTypes: ['realtime', 'historical'],
   dataSource: 'tushare' as ManualSyncDataSource,
   days: 365
 })
@@ -1072,7 +1075,8 @@ const handleSelectionChange = (selection: FavoriteItem[]) => {
 const showSingleSyncDialog = (row: FavoriteItem) => {
   currentSyncStock.value = {
     stock_code: row.stock_code || row.symbol || '',
-    stock_name: row.stock_name || ''
+    stock_name: row.stock_name || '',
+    market: row.market || 'A股'
   }
   void loadPreferredAvailableSyncSource().then(preferredSource => {
     if (preferredSource) {
@@ -1205,6 +1209,7 @@ const handleSingleSync = async () => {
   try {
     const res = await stockSyncApi.syncSingle({
       symbol: currentSyncStock.value.stock_code,
+      market_type: toApiMarketType(currentSyncStock.value.market),
       sync_realtime: singleSyncForm.value.syncTypes.includes('realtime'),
       sync_historical: singleSyncForm.value.syncTypes.includes('historical'),
       sync_financial: singleSyncForm.value.syncTypes.includes('financial'),

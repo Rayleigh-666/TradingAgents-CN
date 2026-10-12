@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 import sys
-
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
@@ -28,6 +27,7 @@ from app.models.user import PyObjectId
 from app.models.notification import NotificationCreate
 from bson import ObjectId
 from app.core.database import get_mongo_db
+from app.core.market_codes import basic_info_collection, guess_market, normalize_symbol
 from app.services.config_service import ConfigService
 from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
 from app.services.redis_progress_tracker import RedisProgressTracker, get_progress_by_id
@@ -77,7 +77,11 @@ def _get_cached_security_name(code: Optional[str]) -> Optional[str]:
     if not code or get_mongodb_client is None:
         return None
 
-    code_str = str(code).strip().zfill(6)
+    raw = str(code).strip()
+    # 按代码形态分流：港股 5 位码若照旧 zfill(6) 会补成 6 位去查 A 股库，必失配
+    # （第五轮 Review P3-2）。市场只能由码形推断，故用 guess_market。
+    market = guess_market(raw)
+    code_str = normalize_symbol(raw, market)
 
     try:
         client = get_mongodb_client()
@@ -93,7 +97,7 @@ def _get_cached_security_name(code: Optional[str]) -> Optional[str]:
 
         db = client[db_name]
 
-        if _is_cn_etf_symbol(code_str):
+        if market == "cn" and _is_cn_etf_symbol(code_str):
             doc = db["etf_basic_info"].find_one(
                 {"code": code_str},
                 {"name": 1, "fund_name": 1, "etf_name": 1, "symbol": 1, "_id": 0}
@@ -101,7 +105,7 @@ def _get_cached_security_name(code: Optional[str]) -> Optional[str]:
             if doc:
                 return doc.get("name") or doc.get("fund_name") or doc.get("etf_name")
 
-        doc = db["stock_basic_info"].find_one(
+        doc = db[basic_info_collection(market)].find_one(
             {"$or": [{"code": code_str}, {"symbol": code_str}]},
             {"name": 1, "stock_name": 1, "_id": 0}
         )

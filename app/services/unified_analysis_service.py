@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from app.utils.timezone import now_tz
+from app.core.market_codes import basic_info_collection, guess_market, normalize_symbol
 from app.core.jdyun import is_jdyun_mode, get_jdyun_batch_max_concurrent
 
 from app.models.analysis import (
@@ -1175,10 +1176,14 @@ class UnifiedAnalysisService:
 
         try:
             db = self._get_db()
-            code_str = str(stock_code).strip().zfill(6)
+            # 按代码形态分流查对应市场的集合：港股 5 位码照旧 zfill(6) 会查错库
+            # （第五轮 Review P3-2）
+            raw = str(stock_code).strip()
+            market = guess_market(raw)
+            code_str = normalize_symbol(raw, market)
 
             if db is not None:
-                if _is_cn_etf_symbol(code_str):
+                if market == "cn" and _is_cn_etf_symbol(code_str):
                     etf_doc = db.etf_basic_info.find_one(
                         {"code": code_str},
                         {"name": 1, "fund_name": 1, "etf_name": 1, "_id": 0}
@@ -1188,7 +1193,7 @@ class UnifiedAnalysisService:
                         if etf_name:
                             return etf_name
 
-                stock_doc = db.stock_basic_info.find_one(
+                stock_doc = db[basic_info_collection(market)].find_one(
                     {"$or": [{"code": code_str}, {"symbol": code_str}]},
                     {"name": 1, "stock_name": 1, "_id": 0}
                 )
