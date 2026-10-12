@@ -11,6 +11,10 @@ from enum import Enum
 from tradingagents.utils.logging_init import get_logger
 logger = get_logger("default")
 
+# 美股「交易所/板块」后缀集合：与路由层/预热层共用同一份定义，
+# 避免「分析链路把 CBOE.BAT 判为 UNKNOWN」这类不一致。
+from app.core.market_codes import US_EXCH_SUFFIXES
+
 
 class StockMarket(Enum):
     """股票市场枚举"""
@@ -55,12 +59,20 @@ class StockUtils:
         if re.match(r'^\d{6}\.(SZ|SH|SS|XSHE|XSHG)$', ticker):
             return StockMarket.CHINA_A
 
-        # 港股：4-5位数字.HK 或 纯4-5位数字（支持0700.HK、09988.HK、00700、9988格式）
-        if re.match(r'^\d{4,5}\.HK$', ticker) or re.match(r'^\d{4,5}$', ticker):
+        # 港股：1-5位数字.HK 或 纯4-5位数字（支持700.HK、0700.HK、09988.HK、00700、9988格式）
+        # 带显式 .HK 后缀时位数不限（`700.HK` 也是合法写法，路由层会补零成 00700）——
+        # 此前只认 4-5 位，`700.HK` 会落 UNKNOWN，与路由层不一致。
+        if re.match(r'^\d{1,5}\.HK$', ticker) or re.match(r'^\d{4,5}$', ticker):
             return StockMarket.HONG_KONG
 
         # 美股：1-5位字母（可带股份类别，BRK.B / BRK-B）
         if re.match(r'^[A-Z]{1,5}[.\-][A-Z]$', ticker):
+            return StockMarket.US
+        # 美股：带已知交易所/板块后缀（AAPL.O 已由上一行覆盖，这里补多字母后缀
+        #       如 CBOE.BAT / GOOGL.OQ）。后缀集合与路由层同源，故「路由认美股」
+        #       与「分析认美股」永远一致。
+        exch_match = re.match(r'^[A-Z]{1,5}[.\-]([A-Z]{2,3})$', ticker)
+        if exch_match and exch_match.group(1) in US_EXCH_SUFFIXES:
             return StockMarket.US
         if re.match(r'^[A-Z]{1,5}$', ticker):
             return StockMarket.US

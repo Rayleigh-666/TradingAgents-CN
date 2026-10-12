@@ -1,9 +1,12 @@
 # 港美股行情预热缓存 设计文档
 
-- 版本：**v3**（v2 需求已落地实施，含全量首跑实测与 3 处批量优化）
-- 日期：2026-10-11
+- 版本：**v7**（v2 需求已落地实施，含全量首跑实测、3 处批量优化、元数据节流，两轮交叉 Review 修正）
+- 日期：2026-10-11（v7：2026-10-12 第三轮 Review 修正）
 - 状态：**已实施并完成首次全量预热**
 - 前置改动：`b4bb7299` 个股分析页恢复港股/美股入口（前端已改完，后端未动）
+
+> 各版本增补章节：§11 = v4（第一轮 Review）、§12 = v5（元数据节流）、
+> §13 = v6（第二轮 Review）、§14 = v7（第三轮 Review）。
 
 ---
 
@@ -783,7 +786,7 @@ US 财务那 9 只 stale 正是 §10.5 提到的「Wind 无有效命中」标的
 | --- | --- |
 | P3-1 自选股 `BRK-B` 不归一 | 已修：`_us_ticker` 增加 `.replace("-", ".")`，下划线/连字符都归一点号。避免自选股 `BRK-B` 与指数侧 `BRK.B` 分裂成两条 universe 记录（后者还永远命中不了缓存） |
 | P3-2 `AAPL.O` 被当股份类别 | 已修：`stocks.py` / `paper.py` 的类别分支改为先判交易所后缀（`_US_EXCH_SUFFIXES`）再判单字母类别 → `AAPL.O → AAPL`、`CBOE.BAT → CBOE` |
-| P3-3 `_prune_source` 对部分拉取敏感 | 已修：新增「成分数暴跌保护」——本次 members 低于库内现有数的 80%（且存量 ≥ 20）时跳过清理并告警，保留旧清单下次自愈 |
+| P3-3 `_prune_source` 对部分拉取敏感 | 已修（**该实现已于 §14.1 被替换**）：曾用「成分数低于库内 80% 即跳过清理」的比例判定，因会锁存而改为按拉取完整性事实判定 |
 | P3-4 测试未落库 | 已补 `tests/test_hk_us_preheat_codes.py`（13 例：代码转换 / 历史不变式 / 暴跌保护 / 三处市场识别一致性） |
 | P3-5 无效行导致 prev_close 跳格 | **误报，无需修**：`_build_daily_ops` 遇无收盘价行直接 `continue`，`prev_close` 保持上一**有效**行的收盘，下一有效行衔接正确（已补测试固化该行为） |
 
@@ -796,11 +799,108 @@ US 财务那 9 只 stale 正是 §10.5 提到的「Wind 无有效命中」标的
 | 市场识别一致性 | `BRK.B` / `BRK-B` / `AAPL.O` / `CBOE.BAT` / `GOOGL.OQ` 在两份实现下输出完全一致 |
 | 历史不变式 | 构造「20 根历史 + 1 行新数据」→ 拒绝切换、历史原样保留 |
 
+## 14. 第三轮交叉 Review 修正记录（v7）
+
+### 14.1 P3（新残留）：`_prune_source` 的「暴跌保护」会锁存 —— 已重做
+
+**问题**：§13.4 的 P3-3 用「本次成分数 < 库内现有数 × 80%」判定上游是否不完整，
+命中就跳过清理。但跳过路径**不写库**，于是：
+
+```
+合法调仓缩水（如 HSTECH 30→23，不足 80%）
+  → 判定为「疑似上游失败」→ 跳过清理 + 不写库
+  → updated_at 不前进 → _index_fresh 永远 False
+  → 每个刷新周期都重拉一遍、每次都以同样的理由拒绝新清单
+  → 只有 force=True 才能自愈
+```
+
+后果轻（多预热几只老成分 + 每轮告警，无数据正确性问题），但①每轮白打 Wind、
+②合法调仓永远进不来、③告警长期存在会稀释真实告警。
+
+**根因**：把「比例」当成了「完整性」的代理。比例低既可能来自上游失败，
+也可能来自合法调仓，两者无法区分，于是只能保守拒绝 —— 而保守动作本身没有出口。
+
+**修法**：让上游把完整性当成**事实**上报，不再靠猜。
+
+1. `_fetch_recursive` 细分到 `_MAX_SPLIT_DEPTH` 仍返回满页（`_SEARCH_PAGE_LIMIT`）时，
+   置 `state["truncated"] = True`（已拿到的行照样收下，只是如实标记）。
+   早期实现把「深度耗尽」与「正常结束」写在同一个分支里，截断被无声吞掉。
+2. `_search_members` 抛异常时把出问题的问题字符串记入 `state["failed"]`。
+3. `_fetch_index_members` 返回 `(members, state)`，新增 `_fetch_incomplete()` /
+   `_fetch_state_note()` 两个判定/格式化辅助。
+4. `refresh_universe` 按事实分流：
+
+| 拉取情况 | 处理 |
+| --- | --- |
+| 不完整（截断或有子查询失败） | **只增量补写、跳过清理**。补写会推进 `updated_at`，于是 `_index_fresh` 在下个刷新周期（7 天）内为 True，**不会**重复重打；下个周期再试 |
+| 完整 | 照常写入 + 清理。成分数明显下降时**仍然接受**，只打一条 WARNING 说明「拉取完整，按调仓接受」 |
+
+`_INDEX_SHRINK_GUARD`（0.8）与 `_MIN_INDEX_MEMBERS_FOR_PRUNE`（20）保留，
+但作用降级为**日志分级**，不再参与「清不清理」的决策。
+
+**取舍**：完整拉取下的轻微「静默丢行」（某桶返回偏少但不抛异常）现在会被当作
+调仓接受，理论上可能误摘一批成分。之所以判定可接受：`_prune_source` 只是摘标签 /
+置 `enabled=False`，**下个周期拉取恢复正常时会自动重新写入并 enabled=True**，
+即误摘最多影响一个刷新周期且可自愈；而锁存是完全无出口的坏状态。
+
+### 14.2 微小（观察 2）：分析链路不认多字母交易所后缀 —— 已修
+
+`tradingagents/utils/stock_utils.py` 的 `identify_stock_market` 原先只认
+`^\d{6}$` / `^\d{6}\.(SZ|SH|...)$` / `^\d{4,5}\.HK$` / `^[A-Z]{1,5}[.\-][A-Z]$` / `^[A-Z]{1,5}$`，
+因此 `CBOE.BAT` 落 `UNKNOWN`（单字母的 `AAPL.O` 因为撞上「1-5 位字母 + 单字母尾段」反而能判 US）。
+
+补齐：
+
+- 新增一条 `^[A-Z]{1,5}[.\-]([A-Z]{2,3})$` 且尾段在 `US_EXCH_SUFFIXES` 中 → US；
+  与路由层同一条判定规则，`BRK.XY` 这类未知尾段两边都不认。
+- 顺带修一个写测试时发现的不一致：港股显式后缀只认 4-5 位，`700.HK` 会落
+  `UNKNOWN`（路由层会补零成 `00700`）。带显式 `.HK` 后缀时位数约定宽松，
+  已放宽为 `^\d{1,5}\.HK$`。纯数字分支仍是 `^\d{4,5}$`（裸 `700` 依旧不认，
+  避免把三位数的 A 股新股代码误判成港股）。
+
+### 14.3 微小（观察 3）+ 值收敛：后缀集合改为单一事实来源 —— 已修
+
+后缀集合原先在四处各写一份字面量副本，注释互相提醒「改动需同步」：
+
+| 位置 | 用途 |
+| --- | --- |
+| `app/worker/hk_us_preheat_service.py` `_WIND_US_EXCH_SUFFIXES` | 从 Wind 代码剥后缀 |
+| `app/routers/stocks.py` `_US_EXCH_SUFFIXES` | 标准化用户输入 |
+| `app/routers/paper.py` `_US_EXCH_SUFFIXES` | 模拟交易下单 |
+| `tradingagents/utils/stock_utils.py`（观察 2 新增） | 分析链路市场识别 |
+
+现收敛到 **`app/core/market_codes.py` 的 `US_EXCH_SUFFIXES`**（`frozenset`，零依赖），
+四处引用同一对象。放在 `app/core/` 而不是 `tradingagents/` 的原因：
+`tradingagents` 的导入链较重（会初始化 ConfigManager 并尝试连 Mongo，
+本地实测约 5 秒），而 `app/core/market_codes.py` 只 import 标准库，
+`app/worker/hk_us_preheat_service.py` 这个可独立 CLI 运行的 worker 能零成本引用；
+反向（`tradingagents` → `app.core`）在本仓库已有先例
+（`tradingagents/graph/trading_graph.py` 已 import `app.core.jdyun`）。
+
+防漂移靠 `tests/test_hk_us_preheat_codes.py` 的断言：
+四处引用的必须是 `is` 同一个集合。
+
+### 14.4 回归验证
+
+| 验证项 | 结果 |
+| --- | --- |
+| 代码/不变式测试 | `tests/test_hk_us_preheat_codes.py` **21/21 通过**（原 13 例 + 8 例新增） |
+| 节流测试 | `tests/test_hk_us_preheat_meta_throttle.py` 10/10 通过（无回归） |
+| 锁存修复 | 预置 30 天前的旧清单 + 不完整拉取 → 补写推进 `updated_at`，`_index_fresh` 转 True；同周期再跑一次 `fetch` 计数为 0（不再每日空转） |
+| 合法缩水 | 30 → 23（不足 80%）且拉取完整 → 清理照常执行，7 只旧成摘标签并 `enabled=False` |
+| 完整性判定 | 单字符表 stub 满页递归 → `truncated=True` 且递归恰好 4 层；Wind 抛异常 → `failed` 记录 1 条并冒泡 |
+| 后缀集合同源 | `preheat` / `stocks` / `paper` / `analysis` 四处 `is` 同一 `frozenset` |
+| 市场识别一致 | `BRK.B` / `BRK-B` / `AAPL.O` / `CBOE.BAT` / `GOOGL.OQ` / `700.HK` / `600519` 在分析侧与路由侧判定一致 |
+| 真实库预演 | ⚠️ 未执行：本机 MongoDB（127.0.0.1:27017）当前未启动，只读预演跳过 |
+
 ## 附：本次勘察的代码索引
 
 | 位置                                                | 内容                                       |
 | ------------------------------------------------- | ---------------------------------------- |
 | `app/routers/stocks.py:356-388`                   | `_detect_market_and_code` 市场识别与代码标准化     |
+| `app/core/market_codes.py`                        | 美股交易所后缀集合的**单一事实来源**（`US_EXCH_SUFFIXES`），四处共用 |
+| `app/worker/hk_us_preheat_service.py:616-668`     | `_fetch_index_members` / `_fetch_recursive` / `_fetch_incomplete`（截断与失败上报，返回 `(members, state)`） |
+| `app/worker/hk_us_preheat_service.py:296-400`     | `refresh_universe`（按拉取完整性分流：仅补写 or 补写 + 清理） |
 | `app/routers/stocks.py:963-985`                   | K 线接口港美股分流点                              |
 | `app/services/foreign_stock_service.py:213/433`   | 港股/美股 **有效 handler 只有 yahoo/akshare 等，无 wind** |
 | `app/services/foreign_stock_service.py:269`       | `_get_source_priority` 读 `datasource_groupings` |

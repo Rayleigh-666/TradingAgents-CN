@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-港美股预热：代码转换 / 历史不变式 / 市场识别一致性 —— 单元测试
+港美股预热：代码转换 / 历史不变式 / 指数拉取完整性 / 市场识别一致性 —— 单元测试
 
-补 c4fec099 那批修复「测试未落库」的缺口，覆盖最易回归的三处：
+覆盖最易回归的四处：
 
 A. 代码转换（`_us_ticker` / `to_internal_symbol` / `to_yahoo_ticker` / `windcode_matches`）
    —— 含第二轮 Review 新修的「连字符归一」（自选股存 `BRK-B` 时不致与 `BRK.B` 分裂）
 B. 日线写入不变式「已存历史永不缩短」
    —— `_purge_conflicting_dates` 只清同日异源、`_write_single_source` 拒绝缩短、
       `_build_daily_ops` 前收链（顺带证伪「无效行导致 prev_close 跳格」）
-C. 市场识别三份实现一致性（stocks.py / paper.py 的 normalized_code 必须一致）
+B2. 指数成分拉取的完整性判定（第三轮 Review 的 P3 残留）
+   —— 拉取不完整（截断 / 子查询失败）→ 只增量补写、跳过清理；
+      拉取完整 → 照常清理（含 HSTECH 30→23 这类合法调仓缩水）；
+      且补写必须推进 `updated_at`，否则「跳过即不写」会永久锁存
+C. 市场识别各处一致性
+   —— stocks.py / paper.py 的 normalized_code 必须一致；
+      `US_EXCH_SUFFIXES` 四处（含分析链路 stock_utils）必须引用同一集合
 
 可直接运行：`python tests/test_hk_us_preheat_codes.py`
 """
@@ -17,7 +23,7 @@ C. 市场识别三份实现一致性（stocks.py / paper.py 的 normalized_code 
 import asyncio
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,17 +118,35 @@ class _FakeColl:
             filt = getattr(op, "_filter", None) or {}
             doc = getattr(op, "_doc", None) or {}
             set_ = dict(doc.get("$set") or {})
+            add_to_set = doc.get("$addToSet") or {}
+            pull = doc.get("$pull") or {}
             existing = [d for d in self.docs if _match(d, filt)]
             if existing:
-                existing[0].update(set_)
+                target = existing[0]
+                target.update(set_)
+                self._apply_array_ops(target, add_to_set, pull)
                 modified += 1
             else:
                 new_doc = dict(filt)
                 new_doc.update(set_)
                 new_doc.update(doc.get("$setOnInsert") or {})
+                self._apply_array_ops(new_doc, add_to_set, pull)
+                new_doc.setdefault("_id", f"auto-{len(self.docs)}")
                 self.docs.append(new_doc)
                 upserted += 1
         return _BulkResult(upserted, modified)
+
+    @staticmethod
+    def _apply_array_ops(target, add_to_set, pull):
+        """支持 $addToSet（去重追加）与 $pull（移除元素），_prune_source 会用到"""
+        for k, v in add_to_set.items():
+            arr = list(target.get(k) or [])
+            if v not in arr:
+                arr.append(v)
+            target[k] = arr
+        for k, v in pull.items():
+            if isinstance(target.get(k), list):
+                target[k] = [x for x in target[k] if x != v]
 
 
 class _FakeCursor:
@@ -297,82 +321,224 @@ def test_build_daily_ops_prev_close_chain_skips_invalid_rows():
     print("  ✓ _build_daily_ops 前收链跳过无效行（P3-5 不成立）")
 
 
-# ==================== B2. 指数成分「暴跌保护」 ====================
+# ==================== B2. 指数成分拉取的完整性判定 ====================
 
 class _FakeSettings:
     HK_US_PREHEAT_INDEXES = "恒生指数"
     HK_US_PREHEAT_UNIVERSE_REFRESH_DAYS = 7
 
 
-def _run_universe_refresh(svc, db, member_count, existing_count):
-    """跑一次 refresh_universe，返回 (stats, 被调用的 prune 来源标签列表)"""
-    universe = _FakeColl([
-        {"market": "HK", "symbol": f"{i:05d}", "sources": ["index:恒生指数"],
-         "enabled": True}
-        for i in range(existing_count)
-    ])
-    db._colls["hk_us_preheat_universe"] = universe
-    calls = {"prune": []}
-
-    async def _fake_merge(coll):
-        return 0, []
-
-    async def _fake_prune(coll, tag, keep):
-        calls["prune"].append(tag)
-        return 0
-
-    def _fake_members(name, market):
-        return [{"windcode": "0700.HK", "name": "X"} for _ in range(member_count)]
-
-    with patch.object(svc, "_merge_favorites", _fake_merge), \
-         patch.object(svc, "_prune_source", _fake_prune), \
-         patch.object(svc, "_fetch_index_members", _fake_members), \
-         patch(DB_PATCH, lambda: db), \
-         patch("app.worker.hk_us_preheat_service.settings", _FakeSettings):
-        stats = asyncio.run(svc.refresh_universe(force=True))
-    # 注意：_prune_source 还会被自选股分支调用一次（tag="favorite"），
-    # 故断言只看指数来源那一项
-    return stats, calls["prune"]
-
-
 _INDEX_TAG = "index:恒生指数"
 
 
-def test_prune_skipped_when_members_shrink_suspiciously():
+def _run_universe_refresh(svc, db, member_count, existing_count,
+                          truncated=False, failed=0, force=True, stale=False,
+                          coll=None):
     """
-    P3-3：上游按字母分批拉取时若有桶失败，成分数会暴跌；
-    此时必须跳过清理，否则缺失桶的成分会被误摘标签 / 误禁用
+    跑一次 refresh_universe，返回 (stats, prune 来源标签列表, 集合, 调用计数)
+
+    `truncated` / `failed` 模拟 `_fetch_index_members` 上报的完整性事实：
+    前者对应「细分到最大深度仍满页」，后者对应「N 个子查询抛异常」。
+    `stale=True` 时预置的旧清单 updated_at 是 30 天前（用于验证新鲜度推进）。
+    `coll` 传入可复用同一集合连续跑多轮（验证「不重复重打」）。
+
+    注意这里**不替换 `_prune_source`**，只在外面套一层记录调用，
+    清理效果因此是真实发生的（断言可以看库内状态，而非只看有没有被调用）。
+    """
+    if coll is None:
+        age = timedelta(days=30) if stale else timedelta(0)
+        coll = _FakeColl([
+            {"_id": f"u{i}", "market": "HK", "symbol": f"{i:05d}",
+             "sources": [_INDEX_TAG], "enabled": True,
+             "updated_at": datetime.now() - age}
+            for i in range(existing_count)
+        ])
+    db._colls["hk_us_preheat_universe"] = coll
+    calls = {"prune": [], "fetch": 0}
+
+    async def _fake_merge(c):
+        return 0, []
+
+    real_prune = svc._prune_source
+
+    async def _spy_prune(c, tag, keep):
+        calls["prune"].append(tag)
+        return await real_prune(c, tag, keep)
+
+    def _fake_members(name, market):
+        calls["fetch"] += 1
+        members = [{"windcode": f"{i:05d}.HK", "name": "X"}
+                   for i in range(member_count)]
+        return members, {"truncated": truncated, "failed": ["q"] * failed}
+
+    with patch.object(svc, "_merge_favorites", _fake_merge), \
+         patch.object(svc, "_prune_source", _spy_prune), \
+         patch.object(svc, "_fetch_index_members", _fake_members), \
+         patch(DB_PATCH, lambda: db), \
+         patch("app.worker.hk_us_preheat_service.settings", _FakeSettings):
+        stats = asyncio.run(svc.refresh_universe(force=force))
+    # 注意：_prune_source 还会被自选股分支调用一次（tag="favorite"），
+    # 故断言只看指数来源那一项
+    return stats, calls["prune"], coll, calls
+
+
+def _tagged_enabled(coll):
+    """库内仍带指数来源标签且 enabled 的标的数"""
+    return len([d for d in coll.docs
+                if _INDEX_TAG in (d.get("sources") or []) and d.get("enabled")])
+
+
+def test_incomplete_fetch_skips_prune():
+    """
+    上游拉取不完整（细分截断）时必须跳过清理：
+    否则缺失桶里的成分会被误摘标签 / 误禁用，少预热一批
     """
     svc = HKUSPreheatService()
     db = _FakeDB({})
-    stats, prune_tags = _run_universe_refresh(svc, db, member_count=5,
-                                              existing_count=100)
-    assert _INDEX_TAG not in prune_tags, f"暴跌时应跳过清理，实际 {prune_tags}"
+    stats, prune_tags, coll, _ = _run_universe_refresh(
+        svc, db, member_count=5, existing_count=100, truncated=True)
+    assert _INDEX_TAG not in prune_tags, f"拉取不完整时应跳过清理，实际 {prune_tags}"
     assert stats[_INDEX_TAG] == 100, stats
-    print("  ✓ 成分数暴跌时跳过清理（P3-3）")
+    assert _tagged_enabled(coll) == 100, "旧清单必须原样保留"
+    assert all(d.get("enabled") for d in coll.docs), "不应有标的被误禁用"
+    print("  ✓ 拉取被截断 → 跳过清理且旧清单原样保留")
 
 
-def test_prune_runs_when_members_look_complete():
-    """成分数正常（≥ 库内 80%）时照常清理，保证调仓能被跟随"""
+def test_failed_bucket_skips_prune():
+    """子查询抛异常同样属于「不完整」，必须跳过清理"""
     svc = HKUSPreheatService()
     db = _FakeDB({})
-    stats, prune_tags = _run_universe_refresh(svc, db, member_count=100,
-                                              existing_count=100)
+    stats, prune_tags, coll, _ = _run_universe_refresh(
+        svc, db, member_count=5, existing_count=100, failed=2)
+    assert _INDEX_TAG not in prune_tags, f"有子查询失败时应跳过清理，实际 {prune_tags}"
+    assert stats[_INDEX_TAG] == 100, stats
+    assert _tagged_enabled(coll) == 100, "旧清单必须原样保留"
+    print("  ✓ 子查询失败 → 跳过清理")
+
+
+def test_complete_fetch_runs_prune():
+    """拉取完整且成分数正常 → 照常清理，保证调仓能被跟随"""
+    svc = HKUSPreheatService()
+    db = _FakeDB({})
+    stats, prune_tags, coll, _ = _run_universe_refresh(
+        svc, db, member_count=100, existing_count=100)
     assert _INDEX_TAG in prune_tags, f"正常情况应执行清理，实际 {prune_tags}"
-    print("  ✓ 成分数正常时照常清理")
+    assert stats[_INDEX_TAG] == 100, stats
+    print("  ✓ 拉取完整且无缩水 → 照常清理")
 
 
-def test_prune_runs_on_first_build():
-    """首次建立（库内为空）不做暴跌保护，正常写入"""
+def test_first_build_runs_prune():
+    """首次建立（库内为空）没有旧清单可保护，正常写入 + 清理"""
     svc = HKUSPreheatService()
     db = _FakeDB({})
-    stats, prune_tags = _run_universe_refresh(svc, db, member_count=5,
-                                              existing_count=0)
+    stats, prune_tags, coll, _ = _run_universe_refresh(
+        svc, db, member_count=5, existing_count=0)
     assert _INDEX_TAG in prune_tags, f"首次建立应正常走清理，实际 {prune_tags}"
-    print("  ✓ 首次建立不做暴跌保护")
+    assert stats[_INDEX_TAG] == 5, stats
+    assert _tagged_enabled(coll) == 5
+    print("  ✓ 首次建立正常写入 + 清理")
 
 
-# ==================== C. 市场识别三份实现一致性 ====================
+def test_complete_shrink_is_accepted():
+    """
+    第三轮 Review 的 P3 残留核心：**合法调仓缩水必须被接受**。
+    HSTECH 一次调仓 30→23（不足 80%），旧实现按比例「锁存」跳过清理，
+    于是新清单永远进不了库、每轮还重复打 Wind，只有 force 才能自愈。
+    """
+    svc = HKUSPreheatService()
+    db = _FakeDB({})
+    stats, prune_tags, coll, _ = _run_universe_refresh(
+        svc, db, member_count=23, existing_count=30)
+    assert _INDEX_TAG in prune_tags, f"合法调仓缩水应照常清理，实际 {prune_tags}"
+    assert stats[_INDEX_TAG] == 23, stats
+    assert _tagged_enabled(coll) == 23, "被剔除的 7 只应摘掉来源标签"
+    assert stats["total"] == 23, "摘光来源的旧成分应 enabled=False，不参与预热"
+    print("  ✓ 拉取完整时的合法缩水（30→23）被接受")
+
+
+def test_incomplete_fetch_advances_freshness_and_does_not_hammer():
+    """
+    锁存的真正根因：跳过清理时**什么都不写** → `updated_at` 停在过去 →
+    `_index_fresh` 永远 False → 每轮重拉、且永远拒绝新清单。
+    修复后不完整拉取仍会增量补写，`updated_at` 因此前进，本刷新周期内不再重打。
+    """
+    svc = HKUSPreheatService()
+    db = _FakeDB({})
+    stats, prune_tags, coll, calls = _run_universe_refresh(
+        svc, db, member_count=5, existing_count=100, truncated=True,
+        force=False, stale=True)
+    assert calls["fetch"] == 1, "首次应发起拉取"
+    assert _INDEX_TAG not in prune_tags, "不完整拉取应跳过清理"
+    assert stats[_INDEX_TAG] == 100, stats
+    assert asyncio.run(svc._index_fresh(coll, _INDEX_TAG, 7)) is True, \
+        "补写必须推进 updated_at，否则会永久锁存"
+
+    # 第二个刷新周期内再跑一次：应当被新鲜度直接跳过，不再打 Wind
+    _, prune_tags2, _, calls2 = _run_universe_refresh(
+        svc, db, member_count=5, existing_count=100, truncated=True,
+        force=False, coll=coll)
+    assert calls2["fetch"] == 0, "同一刷新周期内不应重复拉取（避免每日空转）"
+    assert _INDEX_TAG not in prune_tags2
+    print("  ✓ 不完整拉取推进新鲜度且不重复重打（锁存已修）")
+
+
+def test_fetch_recursive_reports_truncation():
+    """细分到最大深度仍返回满页 → 如实标记 truncated，而不是无声丢弃"""
+    svc = HKUSPreheatService()
+    full_page = [(f"X{i:03d}.HK", "N") for i in range(100)]   # == _SEARCH_PAGE_LIMIT
+    calls = {"n": 0}
+
+    def _stub(question, index_name="", state=None):
+        calls["n"] += 1
+        return list(full_page)
+
+    out, state = {}, {"truncated": False, "failed": []}
+    with patch.object(svc, "_search_members", _stub):
+        # 用单字符表递归，调用次数 = 深度 0..3 共 4 次
+        svc._fetch_recursive("恒生指数", "", ["A"], out, 0, state)
+    assert state["truncated"] is True, state
+    assert calls["n"] == 4, f"应递归到最大深度，实际调用 {calls['n']} 次"
+
+    # 未满页 → 不标记截断
+    out2, state2 = {}, {"truncated": False, "failed": []}
+    with patch.object(svc, "_search_members",
+                      lambda q, i="", state=None: full_page[:99]):
+        svc._fetch_recursive("恒生指数", "", ["A"], out2, 0, state2)
+    assert state2["truncated"] is False
+    assert len(out2) == 99
+    print("  ✓ _fetch_recursive 如实上报截断")
+
+
+def test_search_members_records_failure():
+    """Wind 调用抛异常 → 计入 state['failed']，并冒泡到 _fetch_index_members"""
+    svc = HKUSPreheatService()
+
+    class _BoomClient:
+        def call_table(self, *a, **kw):
+            raise RuntimeError("wind down")
+
+    state = {"truncated": False, "failed": []}
+    with patch.object(svc, "_wind_client", lambda: _BoomClient()):
+        rows = svc._search_members("恒生指数成分股", "恒生指数", state)
+        assert rows == [] and len(state["failed"]) == 1, state
+        members, state2 = svc._fetch_index_members("恒生指数", "HK")
+    assert members == [] and state2["failed"], state2
+    assert svc._fetch_incomplete(state2) is True
+    print("  ✓ 子查询异常计入 failed 并冒泡")
+
+
+def test_fetch_incomplete_ignores_clean_state():
+    """完整性判定：无截断也无失败时不误报为不完整"""
+    assert HKUSPreheatService._fetch_incomplete(None) is False
+    assert HKUSPreheatService._fetch_incomplete({}) is False
+    assert HKUSPreheatService._fetch_incomplete(
+        {"truncated": False, "failed": []}) is False
+    assert HKUSPreheatService._fetch_incomplete({"truncated": True}) is True
+    assert HKUSPreheatService._fetch_incomplete({"failed": ["q"]}) is True
+    print("  ✓ 完整性判定不误报")
+
+
+# ==================== C. 市场识别各处一致性 ====================
 _SAMPLES = [
     ("BRK.B", "US", "BRK.B"), ("BRK-B", "US", "BRK.B"),
     ("AAPL.O", "US", "AAPL"), ("CBOE.BAT", "US", "CBOE"),
@@ -399,6 +565,41 @@ def test_market_detection_consistent_between_routers():
     for raw, _, _ in _SAMPLES:
         assert s(raw) == p(raw), f"{raw}: stocks={s(raw)} paper={p(raw)}"
     print("  ✓ stocks.py 与 paper.py 识别一致")
+
+
+def test_us_exch_suffixes_single_source():
+    """
+    第三轮 Review 观察 3：后缀集合收敛为单一事实来源。
+    历史上是四份字面量副本 + 「改动需同步」注释——任一处漏改都会造成
+    「路由侧认美股、预热/分析侧认不出」的静默失配。
+    """
+    from app.core.market_codes import US_EXCH_SUFFIXES as shared
+    from app.worker.hk_us_preheat_service import US_EXCH_SUFFIXES as preheat
+    from app.routers.stocks import US_EXCH_SUFFIXES as stocks
+    from app.routers.paper import US_EXCH_SUFFIXES as paper
+    from tradingagents.utils.stock_utils import US_EXCH_SUFFIXES as analysis
+    for name, got in (("preheat", preheat), ("stocks", stocks),
+                      ("paper", paper), ("analysis", analysis)):
+        assert got is shared, f"{name} 引用的不是共享集合（后缀集合已漂移）"
+    assert "BAT" in shared and "A" not in shared and "B" not in shared
+    print("  ✓ 四处引用同一后缀集合（防漂移）")
+
+
+def test_analysis_side_market_detection_matches_routers():
+    """
+    第三轮 Review 观察 2：分析链路（identify_stock_market）原先不认多字母
+    交易所后缀，`CBOE.BAT` 会落 UNKNOWN。现与路由层对齐。
+    """
+    from tradingagents.utils.stock_utils import StockUtils, StockMarket
+    _MAP = {"US": StockMarket.US, "HK": StockMarket.HONG_KONG,
+            "CN": StockMarket.CHINA_A}
+    for raw, want_market, _ in _SAMPLES:
+        got = StockUtils.identify_stock_market(raw)
+        assert got is _MAP[want_market], \
+            f"{raw}: 分析侧 {got.value} vs 路由侧 {want_market}"
+    # 未知多字母尾段两侧都不认（路由按默认 A 股兜底、分析按 UNKNOWN）
+    assert StockUtils.identify_stock_market("BRK.XY") is StockMarket.UNKNOWN
+    print("  ✓ 分析侧与路由层市场识别一致（含 CBOE.BAT）")
 
 
 # ==================== 运行入口 ====================

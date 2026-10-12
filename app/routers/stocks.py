@@ -13,6 +13,7 @@ import re
 
 from app.routers.auth_db import get_current_user
 from app.core.database import get_mongo_db
+from app.core.market_codes import US_EXCH_SUFFIXES
 from app.core.response import ok
 from core.skill_runtime.fundamental_factors import get_fundamental_factor_snapshot
 
@@ -353,13 +354,10 @@ def _aggregate_etf_kline_rows(rows: List[Dict[str, Any]], period: str, limit: in
     return items[-limit:]
 
 
-# 美股「交易所/板块」后缀（出现在末段）。与
-# app/worker/hk_us_preheat_service.py 的 `_WIND_US_EXCH_SUFFIXES` 保持一致，
-# 改动时需同步（该处负责从 Wind 代码剥后缀，此处负责用户输入的标准化）。
+# 美股「交易所/板块」后缀集合（出现在末段）。单一事实来源见 app/core/market_codes.py，
+# 与预热服务、模拟交易、分析侧共用同一集合，不再各自维护副本。
 # **刻意不含单字母 A/B/C** —— 那正是股份类别的写法（BRK.A / BRK.B），
 # 收了会把 `BRK.B` 剥成 `BRK`（Yahoo 的 BRK 是 A 类行情）。
-_US_EXCH_SUFFIXES = {"O", "N", "BAT", "OO", "NQ", "OB", "OQ",
-                     "PK", "AM", "GI", "HI"}
 
 
 def _detect_market_and_code(code: str) -> Tuple[str, str]:
@@ -387,7 +385,7 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
     cls_match = re.match(r'^([A-Z]{1,5})[.\-]([A-Z]{1,3})$', code)
     if cls_match:
         base, tail = cls_match.group(1), cls_match.group(2)
-        if tail in _US_EXCH_SUFFIXES:
+        if tail in US_EXCH_SUFFIXES:
             return ('US', base)                    # AAPL.O / CBOE.BAT → AAPL / CBOE
         if len(tail) == 1:
             return ('US', f"{base}.{tail}")        # BRK.B / BRK-B → BRK.B

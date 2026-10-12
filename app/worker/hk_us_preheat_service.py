@@ -20,6 +20,12 @@ K 线接口 `app/routers/stocks.py:963-985` 在 `_detect_market_and_code` 之后
 ----------------
 - Wind `search_stocks` 单次最多返回 100 条，标普500(502)/港股通(667) 会被截断
   → 采用「达上限即细分」的递归分批策略（美股按 A-Z，港股按 0-9）
+  → 细分到最大深度仍满页、或某个子查询抛异常时，**如实上报「本次清单不完整」**，
+    由 `refresh_universe` 跳过清理（只增量补写）。绝不可用「成分数环比缩水」当作
+    上游失败的代理判据：合法调仓缩水与上游失败无法区分，一旦据此跳过清理又不写库，
+    `updated_at` 不前进会导致永久锁存（每次都以同样理由拒绝新清单，只有 force 能自愈）。
+- 美股「交易所/板块」后缀集合（`O`/`N`/`BAT`…）的单一事实来源是
+  `app/core/market_codes.py`，路由层 / 模拟交易 / 分析层共用同一集合。
 - 美股后缀有两种：`.O`(纳斯达克) / `.N`(纽交所)，必须使用 Wind 返回值，不可自拼
 - **股份类别**：Wind 用下划线（`BRK_B.N`），Yahoo 用连字符（`BRK-B`）；内部 symbol 统一为
   点号（`BRK.B`）。三处不一致必须经 `to_internal_symbol` / `to_yahoo_ticker` 转换，
@@ -82,6 +88,7 @@ from pymongo import UpdateOne
 
 from app.core.config import settings
 from app.core.database import get_mongo_db
+from app.core.market_codes import US_EXCH_SUFFIXES
 
 logger = logging.getLogger("webapi")
 
@@ -111,13 +118,12 @@ _HK_CHARS = list("0123456789")
 
 UNIVERSE_COLLECTION = "hk_us_preheat_universe"
 
-# 成分清单「暴跌保护」：本次取到的成分数低于库内现有数的该比例时，判定为上游
-# 部分拉取失败，跳过清理（保留旧清单，下次成功刷新自愈）。
-# 背景：港股通 / 标普 500 成分数超过 Wind 单次查询上限，按首字母分批拉取，
-# 某一桶瞬时失败会让 members 大幅偏少，此时若照常 _prune_source，
-# 缺失桶里的成分会被误摘标签、失去全部来源者还会被 enabled=False（少预热一批）。
+# 成分清单「显著缩水」的告警阈值（**仅用于日志分级，不再拦截清理**）。
+# 清理与否由 `_fetch_index_members` 上报的完整性事实决定：拉取不完整 → 跳过清理；
+# 拉取完整 → 照常清理（含合法调仓缩水）。早期版本按本比例「锁存」跳过清理，
+# 导致 HSTECH 30→23 这类合法调仓被永久拒绝、每轮重复拉取。
 _INDEX_SHRINK_GUARD = 0.8
-# 存量低于该规模时不做暴跌保护（首次建立、或小指数正常波动占比也会很大）
+# 存量低于该规模时不做「显著缩水」告警（首次建立、或小指数正常波动占比也会很大）
 _MIN_INDEX_MEMBERS_FOR_PRUNE = 20
 
 # Wind 用于标记「已退市/已失效」证券的后缀字符
@@ -150,15 +156,10 @@ def _coll_names(market: str) -> Dict[str, str]:
 
 # ==================== 代码转换 ====================
 
-# Wind 美股「交易所/板块」后缀（出现在末段）。用于把 `BRK_B.N` 还原为 `BRK.B`。
-# 只认这些已知后缀，避免把用户输入的类股票点号（`BRK.B` 的 `B`）误当后缀剥掉。
-# 实测本标的池 517 只美股实际只用到 {O(纳斯达克), N(纽交所), BAT(Cboe BZX)}；
-# 其余为容错保留。**刻意不收单字母 A/B/C**——那正是股份类别的写法，收了会把
-# `BRK.A` 剥成 `BRK`（Yahoo 的 A 类行情）。
-_WIND_US_EXCH_SUFFIXES = {"O", "N", "BAT", "OO", "NQ", "OB", "OQ",
-                          "PK", "AM", "GI", "HI"}
+# 美股「交易所/板块」后缀集合：单一事实来源见 `app/core/market_codes.py`
+# （路由侧 / 分析侧共用同一集合，避免「某处漏改后缀 → 剥不掉 → 缓存失配」）。
 # 判定「末段是交易所后缀」（即已是完整 Wind 代码，无需再反查）
-_WIND_US_EXCH_RE = re.compile(r"\.(?:" + "|".join(sorted(_WIND_US_EXCH_SUFFIXES)) + r")$")
+_WIND_US_EXCH_RE = re.compile(r"\.(?:" + "|".join(sorted(US_EXCH_SUFFIXES)) + r")$")
 
 
 def _us_ticker(windcode: str) -> str:
@@ -172,7 +173,7 @@ def _us_ticker(windcode: str) -> str:
     """
     code = (windcode or "").strip().upper()
     parts = code.split(".")
-    if len(parts) >= 2 and parts[-1] in _WIND_US_EXCH_SUFFIXES:
+    if len(parts) >= 2 and parts[-1] in US_EXCH_SUFFIXES:
         parts = parts[:-1]
     # 下划线（Wind）与连字符（Yahoo）都归一点号，三处格式统一到「BRK.B」
     return ".".join(parts).replace("_", ".").replace("-", ".")
@@ -305,6 +306,9 @@ class HKUSPreheatService:
         force=False 时，若某指数清单已存在且未超过 UNIVERSE_REFRESH_DAYS，则跳过重查。
         重查时**会清理已剔除出指数的旧成分**（摘掉该指数来源标签，无其它来源则 enabled=False），
         避免指数调仓后老成分长期滞留；自选股删除后同样会被摘标签。
+        若本次拉取被判定为不完整（子查询失败 / 细分截断），则只增量补写、跳过清理，
+        避免把缺失桶里的成分误摘标签；因为补写会推进 updated_at，下个刷新周期才重试，
+        不会退化成「每天重打且永远拒绝新清单」。
         返回 {来源: enabled 数量} 统计（各分支口径统一）。
         """
         db = get_mongo_db()
@@ -327,25 +331,18 @@ class HKUSPreheatService:
                 logger.info(f"⏭️ 指数 {idx_name} 清单未过期（{n} 只），跳过重查")
                 continue
 
-            members = await asyncio.to_thread(self._fetch_index_members, idx_name, meta["market"])
+            members, fetch_state = await asyncio.to_thread(
+                self._fetch_index_members, idx_name, meta["market"])
             if not members:
-                logger.warning(f"⚠️ 指数 {idx_name} 未取到任何成分股（保留库内旧清单，不清理）")
+                logger.warning(
+                    f"⚠️ 指数 {idx_name} 未取到任何成分股（保留库内旧清单，不清理）"
+                    f"{self._fetch_state_note(fetch_state)}")
                 stats[source_tag] = await coll.count_documents(
                     {"sources": source_tag, "enabled": True})
                 continue
 
-            # ⚠️ 部分拉取保护：成分数相对库内现有清单暴跌 → 疑似上游分批拉取有桶失败，
-            #    此时清理会误摘缺失桶的成分，故跳过（保留旧清单，下次刷新自愈）。
             existing_n = await coll.count_documents(
                 {"sources": source_tag, "enabled": True})
-            if (existing_n >= _MIN_INDEX_MEMBERS_FOR_PRUNE
-                    and len(members) < existing_n * _INDEX_SHRINK_GUARD):
-                logger.warning(
-                    f"⚠️ 指数 {idx_name} 本次仅取到 {len(members)} 只，不足库内 "
-                    f"{existing_n} 只的 {_INDEX_SHRINK_GUARD:.0%}，疑似上游分批拉取"
-                    f"部分失败 → 跳过清理（保留旧清单）")
-                stats[source_tag] = existing_n
-                continue
 
             ops = []
             now = datetime.now()
@@ -374,11 +371,37 @@ class HKUSPreheatService:
                     },
                     upsert=True,
                 ))
+
+            # ⚠️ 上游拉取不完整（子查询失败 / 细分被截断）→ 只增量补写、**跳过清理**。
+            #    照常清理会摘下缺失桶里成分的来源标签，无其它来源者还会被 enabled=False。
+            #    注意这里依然写库：写入会推进 `updated_at`，`_index_fresh` 因而在下个刷新
+            #    周期（默认 7 天）内不会重复打 Wind。早期版本「跳过就什么都不写」会让
+            #    `updated_at` 永远停在过去 → 每轮都重拉、且永远拒绝新清单，即第三轮
+            #    Review 指出的「暴跌保护锁存」，只能靠 force 自愈。
+            if self._fetch_incomplete(fetch_state):
+                if ops:
+                    await coll.bulk_write(ops, ordered=False)
+                n = await coll.count_documents({"sources": source_tag, "enabled": True})
+                stats[source_tag] = n
+                logger.warning(
+                    f"⚠️ 指数 {idx_name} 上游拉取不完整"
+                    f"{self._fetch_state_note(fetch_state)}，本次仅增量补写 "
+                    f"{len(members)} 只、跳过清理（保留库内 {existing_n} 只旧清单，"
+                    f"{refresh_days} 天后重试）")
+                continue
+
             if ops:
                 await coll.bulk_write(ops, ordered=False)
             removed = await self._prune_source(coll, source_tag, keep)
             n = await coll.count_documents({"sources": source_tag, "enabled": True})
             stats[source_tag] = n
+            # 拉取完整却明显缩水 → 按合法调仓处理（如 HSTECH 一次调仓 30→23）。
+            # 旧版本按比例锁存会永久拒绝新清单，故这里只告警、不拦截。
+            if (existing_n >= _MIN_INDEX_MEMBERS_FOR_PRUNE
+                    and n < existing_n * _INDEX_SHRINK_GUARD):
+                logger.warning(
+                    f"⚠️ 指数 {idx_name} 成分数 {existing_n} → {n}"
+                    f"（不足 {_INDEX_SHRINK_GUARD:.0%}），拉取完整，按调仓接受")
             logger.info(f"✅ 指数 {idx_name} 成分股写入 {len(members)} 只"
                         f"（调仓剔除 {removed} 只，现 {n} 只）")
 
@@ -596,35 +619,78 @@ class HKUSPreheatService:
 
     # ---------- 指数成分股反查（含递归分批） ----------
 
-    def _fetch_index_members(self, index_name: str, market: str) -> List[Dict[str, str]]:
-        """同步：反查指数成分股，自动处理 100 条上限"""
+    def _fetch_index_members(self, index_name: str, market: str
+                             ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+        """
+        同步：反查指数成分股，自动处理 100 条上限。
+
+        返回 `(members, state)`，`state` 描述**本次拉取是否完整**：
+        - `truncated`: 细分到最大深度仍返回满页 → 该桶被上游截断
+        - `failed`:    抛异常的子查询（问题字符串）列表
+
+        为什么要上报完整性：调用方原本只能按「成分数环比暴跌」猜测上游有没有问题，
+        于是「合法调仓缩水」（HSTECH 30→23）与「上游部分失败」无法区分，
+        前者会被误判成后者而永久拒绝新清单。现在按事实判定，不再靠猜。
+        """
         chars = _HK_CHARS if market == "HK" else _US_CHARS
         collected: Dict[str, Dict[str, str]] = {}
-        self._fetch_recursive(index_name, "", chars, collected, 0)
-        return list(collected.values())
+        state: Dict[str, Any] = {"truncated": False, "failed": []}
+        self._fetch_recursive(index_name, "", chars, collected, 0, state)
+        return list(collected.values()), state
 
-    def _fetch_recursive(self, index_name: str, prefix: str,
-                         chars: Sequence[str], out: Dict[str, Dict[str, str]], depth: int) -> None:
+    def _fetch_recursive(self, index_name: str, prefix: str, chars: Sequence[str],
+                         out: Dict[str, Dict[str, str]], depth: int,
+                         state: Dict[str, Any]) -> None:
         """递归分批：返回数达到上限（可能被截断）时，按字符集继续细分"""
         if prefix:
             question = f"{index_name}成分股中代码以{prefix}开头的股票"
         else:
             question = f"{index_name}成分股"
 
-        rows = self._search_members(question, index_name)
-        if len(rows) < _SEARCH_PAGE_LIMIT or depth >= _MAX_SPLIT_DEPTH:
+        rows = self._search_members(question, index_name, state)
+        if len(rows) < _SEARCH_PAGE_LIMIT:
+            for wc, name in rows:
+                out.setdefault(wc, {"windcode": wc, "name": name})
+            return
+        if depth >= _MAX_SPLIT_DEPTH:
+            # 细分到最大深度仍返回满页 → 该桶被截断，本次清单必然不完整。
+            # 已拿到的行照样收下（有总比没有好），但如实标记截断。
+            state["truncated"] = True
             for wc, name in rows:
                 out.setdefault(wc, {"windcode": wc, "name": name})
             return
         for c in chars:
-            self._fetch_recursive(index_name, prefix + c, chars, out, depth + 1)
+            self._fetch_recursive(index_name, prefix + c, chars, out, depth + 1, state)
 
-    def _search_members(self, question: str, index_name: str = "") -> List[Tuple[str, str]]:
-        """调用 Wind search_stocks，返回 [(windcode, name)]"""
+    @staticmethod
+    def _fetch_incomplete(fetch_state: Optional[Dict[str, Any]]) -> bool:
+        """本次指数成分拉取是否可判定为「不完整」（子查询失败 / 细分截断）"""
+        if not fetch_state:
+            return False
+        return bool(fetch_state.get("truncated") or fetch_state.get("failed"))
+
+    @staticmethod
+    def _fetch_state_note(fetch_state: Optional[Dict[str, Any]]) -> str:
+        """把拉取完整性信息拼成日志片段（完整时返回空串）"""
+        if not fetch_state:
+            return ""
+        bits = []
+        if fetch_state.get("truncated"):
+            bits.append("细分深度已达上限仍是满页")
+        failed = fetch_state.get("failed") or []
+        if failed:
+            bits.append(f"{len(failed)} 个子查询失败")
+        return f"（{'；'.join(bits)}）" if bits else ""
+
+    def _search_members(self, question: str, index_name: str = "",
+                        state: Optional[Dict[str, Any]] = None) -> List[Tuple[str, str]]:
+        """调用 Wind search_stocks，返回 [(windcode, name)]；异常计入 state['failed']"""
         try:
             df = self._wind_client().call_table("stock_data", "search_stocks", {"question": question})
         except Exception as e:
             logger.warning(f"⚠️ search_stocks('{question}') 失败: {e}")
+            if state is not None:
+                state["failed"].append(question)
             return []
         if df is None or getattr(df, "empty", True):
             return []
