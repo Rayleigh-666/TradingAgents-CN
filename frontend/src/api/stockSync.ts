@@ -6,11 +6,14 @@ import { ApiClient } from './request'
 
 export interface SingleStockSyncRequest {
   symbol: string
+  /** 市场类型：hk/us 走港美股按需同步链路（主备双源预热服务），默认 cn */
+  market_type?: 'cn' | 'hk' | 'us'
   sync_realtime?: boolean
   sync_historical: boolean
   sync_financial: boolean
   sync_basic?: boolean
-  data_source: 'tushare' | 'akshare' | 'qmt'
+  /** 数据源仅 A 股生效；港美股由预热服务按配置决定（默认 Yahoo 主 / Wind 备） */
+  data_source?: 'tushare' | 'akshare' | 'qmt'
   days: number
 }
 

@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 
 from app.core.database import get_mongo_db
+from app.core.market_codes import normalize_symbol, resolve_market
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class DataValidationService:
         校验股票数据的完整性和有效性
         
         Args:
-            symbol: 股票代码（6位）
+            symbol: 股票代码（A股6位 / 港股1-5位 / 美股ticker，内部按 market_type 归一化）
             analysis_date: 分析日期（YYYY-MM-DD格式）
             market_type: 市场类型（cn/hk/us）
             check_basic_info: 是否检查基础信息
@@ -70,9 +71,21 @@ class DataValidationService:
             DataValidationResult: 校验结果
         """
         db = self._get_db()
-        symbol6 = str(symbol).zfill(6)
+        # 🔥 按市场归一化代码（cn→6位 / hk→5位 / us→裸ticker）：
+        # 港股 5 位码曾被无条件 zfill(6) 补成 003669，与 stock_basic_info_hk 的
+        # 5 位码永远匹配不上，误报「基础信息不存在」。切勿在此处自行补零。
+        market_type = resolve_market(market_type)
+        symbol6 = normalize_symbol(symbol, market_type)
         missing_data = []
         details = {}
+
+        if not symbol6:
+            return DataValidationResult(
+                is_valid=False,
+                message=f"股票代码格式错误: {symbol}",
+                missing_data=["symbol_format"],
+                details={"error": "无法从输入中提取股票代码", "input": str(symbol)}
+            )
         
         try:
             # 解析分析日期（支持多种格式：YYYY-MM-DD 或 ISO 8601 格式，或已经是 datetime 对象）

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from app.routers.auth_db import get_current_user
 from app.core.response import ok
 from app.core.database import get_mongo_db
+from app.core.market_codes import normalize_symbol
 from app.worker.tushare_sync_service import get_tushare_sync_service
 from app.worker.akshare_sync_service import get_akshare_sync_service
 from app.worker.financial_data_sync_service import get_financial_sync_service
@@ -276,12 +277,13 @@ async def _sync_latest_to_market_quotes(symbol: str) -> None:
 
 class SingleStockSyncRequest(BaseModel):
     """单股票同步请求"""
-    symbol: str = Field(..., description="股票代码（6位）")
+    symbol: str = Field(..., description="股票代码（A股6位 / 港股1-5位 / 美股ticker）")
+    market_type: str = Field("cn", description="市场类型: cn/hk/us（hk/us 走港美股按需同步链路）")
     sync_realtime: bool = Field(False, description="是否同步实时行情")
     sync_historical: bool = Field(True, description="是否同步历史数据")
     sync_financial: bool = Field(True, description="是否同步财务数据")
     sync_basic: bool = Field(False, description="是否同步基础数据")
-    data_source: str = Field("tushare", description="数据源: tushare/akshare/qmt")
+    data_source: str = Field("tushare", description="数据源: tushare/akshare/qmt（仅 A 股生效）")
     days: int = Field(30, description="历史数据天数", ge=1, le=3650)
 
 
@@ -295,9 +297,202 @@ class BatchStockSyncRequest(BaseModel):
     days: int = Field(30, description="历史数据天数", ge=1, le=3650)
 
 
+# ==================== 港股 / 美股：按需同步 ====================
+
+FOREIGN_MARKETS = ("hk", "us")
+
+
+def _interpret_preheat_stats(stats: Dict[str, Any]) -> tuple:
+    """
+    把预热服务返回的统计翻译成 (是否成功, 失败原因)。
+
+    ⚠️ `skipped` 表示「节流/增量窗口内数据已是最新，无需发起请求」，属正常成功，
+    不能与 `failed` 一起当作失败判据（首发后二次同步必然命中 skipped）。
+    """
+    ok = int(stats.get("ok", 0) or 0)
+    skipped = int(stats.get("skipped", 0) or 0)
+    failed = int(stats.get("failed", 0) or 0)
+    total = int(stats.get("total", 0) or 0)
+    if total == 0:
+        return False, "标的未进入预热池（universe），请先同步基础信息"
+    if ok > 0 or (skipped > 0 and failed == 0):
+        return True, ""
+    return False, ""
+
+
+async def _sync_latest_foreign_quote(symbol: str, market: str) -> bool:
+    """
+    把 `stock_daily_quotes_<hk|us>` 的最新一根日线落到 `market_quotes_<hk|us>`。
+
+    港美股没有独立的实时行情通道（原有 `*_sync_service.sync_quotes_from_source`
+    是全市场批量），单股分析只需「最新收盘」即可满足数据校验的实时行情检查，
+    同时让自选股列表 / 个股详情页能读到现价。
+    """
+    db = get_mongo_db()
+    daily_coll = db[f"stock_daily_quotes_{market.lower()}"]
+    quotes_coll = db[f"market_quotes_{market.lower()}"]
+
+    latest = await daily_coll.find_one({"symbol": symbol}, sort=[("trade_date", -1)])
+    if not latest:
+        logger.warning(f"⚠️ {market}:{symbol} 无日线数据，跳过 market_quotes 回填")
+        return False
+
+    close = latest.get("close")
+    quote = {
+        "code": symbol, "symbol": symbol,
+        "close": close, "price": close, "current_price": close,
+        "open": latest.get("open"), "high": latest.get("high"), "low": latest.get("low"),
+        "volume": latest.get("volume"), "amount": latest.get("amount"),
+        "pre_close": latest.get("pre_close"), "change": latest.get("change"),
+        "pct_chg": latest.get("pct_chg"),
+        "market": market, "full_symbol": latest.get("full_symbol"),
+        "currency": "HKD" if market == "HK" else "USD",
+        "trade_date": latest.get("trade_date"),
+        "updated_at": datetime.utcnow(),
+    }
+    await quotes_coll.update_one({"code": symbol}, {"$set": quote}, upsert=True)
+    logger.info(f"✅ {market}:{symbol} 最新日线已回填 market_quotes_{market.lower()} "
+                f"(trade_date={latest.get('trade_date')}, close={close})")
+    return True
+
+
+async def _run_foreign_stock_sync(request: SingleStockSyncRequest, market: str) -> dict:
+    """
+    港股/美股单股按需同步。
+
+    复用 `HKUSPreheatService`（与定时预热同一套代码转换、主备双源与落库口径），
+    避免在路由层另造一套 schema 造成读写口径漂移：
+      1. `ensure_symbols` 先把池外标的并入 universe（复现"自选股并入"路径）
+      2. 基础信息 / 日线 / 财务分别调预热服务的单股同步（`force=True` 绕过节流）
+      3. 日线同步后把最新收盘回填 `market_quotes_<hk|us>`
+
+    数据源由预热服务按配置决定（默认 Yahoo 主 / Wind 备，见
+    `HK_US_PREHEAT_PRIMARY_SOURCE`），故此处忽略 `request.data_source`。
+    """
+    from app.worker.hk_us_preheat_service import HKUSPreheatService
+
+    market_key = market.upper()
+    symbol = normalize_symbol(request.symbol, market_key)
+    result = {
+        "symbol": symbol,
+        "market_type": market_key,
+        "realtime_sync": None,
+        "historical_sync": None,
+        "financial_sync": None,
+        "basic_sync": None,
+    }
+
+    if not symbol:
+        result["basic_sync"] = {
+            "success": False,
+            "error": f"无法识别的{market_key}股票代码: {request.symbol}",
+        }
+        result["overall_success"] = False
+        return result
+
+    logger.info(f"🌏 港美股按需同步: {market_key}:{symbol} "
+                f"(basic={request.sync_basic}, historical={request.sync_historical}, "
+                f"financial={request.sync_financial}, realtime={request.sync_realtime})")
+
+    service = HKUSPreheatService()
+    try:
+        await service.ensure_symbols([symbol], market_key)
+    except Exception as e:
+        # 入池失败不致命：若该标的已在池内，后续取数仍可成功
+        logger.warning(f"⚠️ {market_key}:{symbol} 并入预热标的池失败: {e}")
+
+    if request.sync_basic:
+        try:
+            stats = await service.sync_basic_info(
+                symbols=[symbol], market=market_key, force=True)
+            ok, why = _interpret_preheat_stats(stats)
+            result["basic_sync"] = {
+                "success": ok,
+                "message": f"基础信息同步{'成功' if ok else '失败'}",
+                "error": None if ok else (why or f"未从数据源获取到 {symbol} 的基础信息"),
+            }
+            logger.info(f"✅ {market_key}:{symbol} 基础信息同步: {stats}")
+        except Exception as e:
+            logger.error(f"❌ {market_key}:{symbol} 基础信息同步失败: {e}")
+            result["basic_sync"] = {"success": False, "error": str(e)}
+
+    if request.sync_historical:
+        try:
+            stats = await service.sync_daily(
+                symbols=[symbol], market=market_key, lookback_days=request.days)
+            rows = int(stats.get("rows", 0) or 0)
+            ok, why = _interpret_preheat_stats(stats)
+            if ok and not stats.get("ok"):
+                message = "历史数据已是最新，无需更新"
+            elif ok:
+                message = f"同步了 {rows} 条历史记录"
+            else:
+                message = "历史数据同步失败"
+            result["historical_sync"] = {
+                "success": ok,
+                "records": rows,
+                "message": message,
+                "error": None if ok else (why or f"数据源未返回 {symbol} 的日线数据"),
+            }
+            logger.info(f"✅ {market_key}:{symbol} 日线同步: {stats}")
+
+            if ok:
+                try:
+                    await _sync_latest_foreign_quote(symbol, market_key)
+                except Exception as e:
+                    logger.warning(f"⚠️ {market_key}:{symbol} 回填 market_quotes 失败: {e}")
+        except Exception as e:
+            logger.error(f"❌ {market_key}:{symbol} 历史数据同步失败: {e}")
+            result["historical_sync"] = {"success": False, "error": str(e)}
+
+    if request.sync_financial:
+        try:
+            stats = await service.sync_financial(
+                symbols=[symbol], market=market_key, force=True)
+            ok, why = _interpret_preheat_stats(stats)
+            result["financial_sync"] = {
+                "success": ok,
+                "message": "财务数据同步成功" if ok else "财务数据同步失败",
+                "error": None if ok else (why or "财务数据源（Wind）未返回该标的的财务记录"),
+            }
+            logger.info(f"✅ {market_key}:{symbol} 财务数据同步: {stats}")
+        except Exception as e:
+            logger.error(f"❌ {market_key}:{symbol} 财务数据同步失败: {e}")
+            result["financial_sync"] = {"success": False, "error": str(e)}
+
+    if request.sync_realtime:
+        # 港美股无独立实时通道，用「最新日线」作为最新价
+        try:
+            ok = await _sync_latest_foreign_quote(symbol, market_key)
+            result["realtime_sync"] = {
+                "success": ok,
+                "message": "已回填最新日线作为最新行情" if ok
+                           else "无日线数据可回填（请先勾选「历史行情数据」同步日线）",
+                "data_source_used": "daily_cache",
+            }
+        except Exception as e:
+            logger.error(f"❌ {market_key}:{symbol} 实时行情回填失败: {e}")
+            result["realtime_sync"] = {"success": False, "error": str(e)}
+
+    result["overall_success"] = (
+        (not request.sync_realtime or result["realtime_sync"].get("success", False)) and
+        (not request.sync_historical or result["historical_sync"].get("success", False)) and
+        (not request.sync_financial or result["financial_sync"].get("success", False)) and
+        (not request.sync_basic or result["basic_sync"].get("success", False))
+    )
+    return result
+
+
 async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
     """执行单股票数据同步，返回原始同步结果字典。"""
-    logger.info(f"📊 开始同步单个股票: {request.symbol} (数据源: {request.data_source})")
+    logger.info(f"📊 开始同步单个股票: {request.symbol} "
+                f"(市场: {request.market_type}, 数据源: {request.data_source})")
+
+    # 🔥 港股/美股走专用按需链路（Tushare/AKShare/QMT 只覆盖 A 股与 ETF）
+    if str(request.market_type or "cn").strip().lower() in FOREIGN_MARKETS:
+        return await _run_foreign_stock_sync(
+            request, str(request.market_type).strip().lower())
+
     is_etf = _is_cn_etf_symbol(request.symbol)
     if is_etf:
         logger.info(f"📈 {request.symbol} 识别为 ETF，历史/基础同步将走 ETF 专用同步服务")
@@ -1076,7 +1271,7 @@ async def get_sync_status(
 
 @router.get("/validate", response_model=dict)
 async def validate_stock_data(
-    symbol: str = Query(..., description="股票代码（6位）"),
+    symbol: str = Query(..., description="股票代码（A股6位 / 港股1-5位 / 美股ticker）"),
     analysis_date: Optional[str] = Query(None, description="分析日期（YYYY-MM-DD），默认为今天"),
     market_type: str = Query("cn", description="市场类型：cn/hk/us"),
     check_basic_info: bool = Query(True, description="是否检查基础信息"),

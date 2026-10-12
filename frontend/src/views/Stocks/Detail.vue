@@ -327,6 +327,7 @@ import { isJdyunMode } from '@/utils/config'
 import { getReportName } from '@/utils/reportPresentation'
 import { getTaskList, getTaskDetail, TaskType, TaskStatus } from '@/api/unifiedTasks'
 import { reviewApi } from '@/api/review'
+import { toApiMarketType } from '@/utils/market'
 import { portfolioApi } from '@/api/portfolio'
 
 // 新版股票详情页子组件
@@ -640,6 +641,7 @@ async function handleSync() {
   try {
     const res = await stockSyncApi.syncSingle({
       symbol: code.value,
+      market_type: toApiMarketType(market.value),
       sync_realtime: syncForm.syncTypes.includes('realtime'),
       sync_historical: syncForm.syncTypes.includes('historical'),
       sync_financial: syncForm.syncTypes.includes('financial'),

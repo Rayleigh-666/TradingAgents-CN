@@ -51,9 +51,28 @@ export const getMarketByStockCode = (stockCode: string): string => {
   return 'A股'
 }
 
+/**
+ * 把各种市场写法归一化为后端同步/校验接口的 market_type（cn/hk/us）。
+ *
+ * 注意：`normalizeMarketForAnalysis` 是 V3.0「仅 A 股」时代的助手，会把港美股
+ * 一律降级成 A股，**不可**用于数据同步/校验（会把港股请求打到 A 股链路上）。
+ */
+export const toApiMarketType = (market: any): 'cn' | 'hk' | 'us' => {
+  const raw = String(market ?? '').trim().toUpperCase()
+
+  if (['HK', 'HKG', 'HK_STOCKS', 'HONGKONG', 'HONG KONG', '港股', '香港'].includes(raw)) {
+    return 'hk'
+  }
+  if (['US', 'USA', 'US_STOCKS', '美股', '美国'].includes(raw)) {
+    return 'us'
+  }
+  return 'cn'
+}
+
 export default {
   normalizeMarketForAnalysis,
   exchangeCodeToMarket,
-  getMarketByStockCode
+  getMarketByStockCode,
+  toApiMarketType
 }
 

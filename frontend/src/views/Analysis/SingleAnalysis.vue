@@ -855,6 +855,7 @@ import { stocksApi, type FundamentalsResponse } from '@/api/stocks'
 import { stockSyncApi, type StockSyncTaskStatus, type SingleStockSyncResponse } from '@/api/stockSync'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
+import { toApiMarketType } from '@/utils/market'
 import { ApiClient } from '@/api/request'
 import { configApi } from '@/api/config'
 import DeepModelSelector from '@/components/DeepModelSelector.vue'
@@ -1437,6 +1438,7 @@ const handleSyncMissingData = async () => {
 
   const normalizedCode = validation.normalizedCode || stockCode.toUpperCase()
   const missingData = validationResult.value?.missing_data || [] as string[]
+  const marketType = toApiMarketType(analysisForm.market)
 
   // 根据缺失数据确定同步什么
   const syncTypes: string[] = []
@@ -1454,11 +1456,13 @@ const handleSyncMissingData = async () => {
     syncStatus.value = 'running'
     const res = await stockSyncApi.syncSingle({
       symbol: normalizedCode,
+      market_type: marketType,
       sync_realtime: syncTypes.includes('realtime'),
       sync_historical: syncTypes.includes('historical'),
       sync_financial: syncTypes.includes('financial'),
       sync_basic: syncTypes.includes('basic'),
-      data_source: 'akshare',
+      // 港股/美股由预热服务按配置选源（默认 Yahoo 主 / Wind 备），此处 data_source 不生效
+      ...(marketType === 'cn' ? { data_source: 'akshare' as const } : {}),
       days: 365
     })
 

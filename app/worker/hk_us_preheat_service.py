@@ -88,7 +88,12 @@ from pymongo import UpdateOne
 
 from app.core.config import settings
 from app.core.database import get_mongo_db
-from app.core.market_codes import US_EXCH_SUFFIXES
+from app.core.market_codes import (
+    US_EXCH_SUFFIXES,
+    internal_to_windcode,
+    normalize_symbol,
+    normalize_us_symbol,
+)
 
 logger = logging.getLogger("webapi")
 
@@ -117,6 +122,10 @@ _US_CHARS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _HK_CHARS = list("0123456789")
 
 UNIVERSE_COLLECTION = "hk_us_preheat_universe"
+
+# 按需注册来源标签：用户在单股分析页临时分析、未入池的标的
+# （正式来源为 "index:<指数名>" 与 "favorite"）
+ON_DEMAND_SOURCE = "ondemand"
 
 # 成分清单「显著缩水」的告警阈值（**仅用于日志分级，不再拦截清理**）。
 # 清理与否由 `_fetch_index_members` 上报的完整性事实决定：拉取不完整 → 跳过清理；
@@ -170,13 +179,11 @@ def _us_ticker(windcode: str) -> str:
         BRK.B   → BRK.B
         BRK-B   → BRK.B   （自选股可能存 Yahoo 风格连字符，须归一，
                              否则会与指数侧的 BRK.B 变成两条 universe 记录）
+
+    实现已收敛到 `app/core/market_codes.normalize_us_symbol`（单一事实来源），
+    此处仅保留旧名以免大范围改动调用点。
     """
-    code = (windcode or "").strip().upper()
-    parts = code.split(".")
-    if len(parts) >= 2 and parts[-1] in US_EXCH_SUFFIXES:
-        parts = parts[:-1]
-    # 下划线（Wind）与连字符（Yahoo）都归一点号，三处格式统一到「BRK.B」
-    return ".".join(parts).replace("_", ".").replace("-", ".")
+    return normalize_us_symbol(windcode)
 
 
 def to_internal_symbol(windcode: str, market: str) -> str:
@@ -421,6 +428,61 @@ class HKUSPreheatService:
         stats["total"] = total
         logger.info(f"📊 Universe 刷新完成，合计 {total} 只：{stats}")
         return stats
+
+    async def ensure_symbols(self, symbols: Sequence[str], market: str) -> Dict[str, Any]:
+        """
+        把「按需分析」的标的并入 universe（幂等），使用户临时输入的池外标的
+        （如港股 3669）也能被 `sync_basic_info` / `sync_daily` / `sync_financial`
+        按 symbol 过滤到。
+
+        与自选股并入 `_merge_favorites` 同构，只是来源标签为 `ON_DEMAND_SOURCE`：
+        - HK：由 5 位内部 symbol 补出 4 位 Wind/Yahoo 代码（03669 → 3669.HK）
+        - US：先存裸 ticker（AAPL / BRK.B），随后由 `_resolve_us_windcodes` 反查
+          交易所后缀（查不到则打标 `yahoo_only`，只走 Yahoo，避免误写他司数据）
+
+        返回值仅用于日志/结果透出，不参与成功判定。
+        """
+        db = get_mongo_db()
+        coll = db[UNIVERSE_COLLECTION]
+        market_key = (market or "").strip().upper()
+        now = datetime.now()
+
+        normalized: List[str] = []
+        ops = []
+        for raw in symbols or []:
+            symbol = normalize_symbol(raw, market_key)
+            if not symbol:
+                logger.warning(f"⚠️ 跳过无法归一化的代码: {raw!r} (market={market_key})")
+                continue
+            normalized.append(symbol)
+            windcode = internal_to_windcode(symbol, market_key)
+            ops.append(UpdateOne(
+                {"market": market_key, "symbol": symbol},
+                {
+                    "$set": {
+                        "windcode": windcode,
+                        "yahoocode": to_yahoo_ticker(windcode, market_key),
+                        "full_symbol": to_full_symbol(windcode, market_key),
+                        "enabled": True,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "symbol": symbol, "market": market_key, "added_at": now,
+                    },
+                    "$addToSet": {"sources": ON_DEMAND_SOURCE},
+                },
+                upsert=True,
+            ))
+
+        if ops:
+            await coll.bulk_write(ops, ordered=False)
+            logger.info(f"🧩 按需并入 universe {len(ops)} 只: {normalized}")
+
+        # 美股：补全 Wind 交易所后缀（缺后缀时 Wind 基础信息/财务/日线均会静默失效）
+        if market_key == "US" and normalized:
+            await self._resolve_us_windcodes(coll)
+
+        return {"market": market_key, "symbols": normalized, "upserted": len(ops)}
 
     async def _prune_source(self, coll, source_tag: str,
                             keep: Sequence[Tuple[str, str]]) -> int:

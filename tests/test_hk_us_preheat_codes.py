@@ -585,6 +585,106 @@ def test_us_exch_suffixes_single_source():
     print("  ✓ 四处引用同一后缀集合（防漂移）")
 
 
+def test_normalize_symbol_by_market():
+    """
+    `app/core/market_codes.normalize_symbol` —— 校验/同步链路共用的按市场归一化。
+
+    回归背景：数据校验服务曾对所有市场无条件 `zfill(6)`，把港股 5 位码
+    `03669` 补成 `003669`，与 `stock_basic_info_hk` 的 5 位码永不匹配，
+    表现为「基础信息不存在」的误报（且数据同步成功也无法自愈）。
+    """
+    from app.core.market_codes import internal_to_windcode, normalize_symbol
+
+    assert normalize_symbol("3669", "hk") == "03669"
+    assert normalize_symbol("03669", "hk") == "03669"
+    assert normalize_symbol("003669", "hk") == "03669"        # 旧 bug 脏值 → 修回 5 位
+    assert normalize_symbol("0700.HK", "hk") == "00700"
+    assert normalize_symbol("700", "hk") == "00700"
+
+    assert normalize_symbol("aapl", "us") == "AAPL"
+    assert normalize_symbol("AAPL.O", "us") == "AAPL"
+    assert normalize_symbol("BRK-B", "us") == "BRK.B"
+    assert normalize_symbol("BRK_B.N", "us") == "BRK.B"
+
+    assert normalize_symbol("1", "cn") == "000001"
+    assert normalize_symbol("600519", "cn") == "600519"
+
+    # 市场被写成中文/大写也应正确分流
+    assert normalize_symbol("003669", "港股") == "03669"
+    assert normalize_symbol("AAPL", "US_STOCKS") == "AAPL"
+
+    # 内部 symbol → Wind 代码（universe 注册用）
+    assert internal_to_windcode("03669", "hk") == "3669.HK"
+    assert internal_to_windcode("00700", "hk") == "0700.HK"
+    assert internal_to_windcode("NVDA", "us") == "NVDA"
+
+    # 第五轮 Review P3-1：无效长码必须判为「无法识别」，不得静默截末 4 位
+    # 注册成另一只股票（"1234567" → "4567.HK" 曾会把 3669 之外的他司数据写进来）
+    assert normalize_symbol("123456", "hk") == ""
+    assert normalize_symbol("1234567", "hk") == ""
+    assert internal_to_windcode("1234567", "hk") == ""
+    # 但旧脏值（6 位、有效 4 位）仍须修回 5 位，不能被 guard 误伤
+    assert normalize_symbol("003669", "hk") == "03669"
+    assert internal_to_windcode("003669", "hk") == "3669.HK"
+    print("  ✓ 按市场归一化内部 symbol（含旧补零脏值修复 + 无效长码拒绝）")
+
+
+def test_guess_market_and_collection_routing():
+    """
+    第五轮 Review P3-2：名称解析拿不到 market 参数，只能按码形推断市场，
+    否则港股 5 位码会被 zfill(6) 后查 A 股库 → 永远失配（报告里退回「股票03669」）。
+    """
+    from app.core.market_codes import basic_info_collection, guess_market, normalize_symbol
+
+    cases = {
+        "03669": ("hk", "03669"),        # 港股 5 位
+        "00700": ("hk", "00700"),
+        "700": ("hk", "00700"),          # 港股 4 位
+        "0700.HK": ("hk", "00700"),      # 显式 .HK 后缀优先
+        "000001": ("cn", "000001"),      # A 股 6 位
+        "003669": ("cn", "003669"),      # 6 位（含脏值形态）按 A 股处理，P3-3
+        "600519.SH": ("cn", "600519"),
+        "AAPL": ("us", "AAPL"),
+        "AAPL.O": ("us", "AAPL"),
+        "BRK.B": ("us", "BRK.B"),
+        "": ("cn", ""),
+    }
+    for raw, (want_market, want_code) in cases.items():
+        got_market = guess_market(raw)
+        assert got_market == want_market, f"{raw!r}: market {got_market} != {want_market}"
+        assert normalize_symbol(raw, got_market) == want_code, \
+            f"{raw!r}: code {normalize_symbol(raw, got_market)!r} != {want_code!r}"
+
+    # 集合名按市场分流（名称解析共用，避免各处硬编码）
+    assert basic_info_collection("hk") == "stock_basic_info_hk"
+    assert basic_info_collection("us") == "stock_basic_info_us"
+    assert basic_info_collection("cn") == "stock_basic_info"
+    assert basic_info_collection("港股") == "stock_basic_info_hk"
+    assert basic_info_collection("未知") == "stock_basic_info"
+
+    # 端到端：港股 03669 必须命中 _hk 集合且键为 5 位
+    m = guess_market("03669")
+    assert (basic_info_collection(m), normalize_symbol("03669", m)) == \
+        ("stock_basic_info_hk", "03669")
+    print("  ✓ 名称解析按码形分流（港股不再补成 6 位查 A 股库）")
+
+
+def test_preheat_stats_skipped_is_success():
+    """
+    单股按需同步的成败判定：`skipped`＝节流/增量窗口内「数据已是最新」，
+    必须算成功——否则首发后的第二次同步会被误报为失败。
+    """
+    from app.routers.stock_sync import _interpret_preheat_stats
+
+    assert _interpret_preheat_stats({"total": 1, "ok": 1, "skipped": 0, "failed": 0})[0] is True
+    assert _interpret_preheat_stats({"total": 1, "ok": 0, "skipped": 1, "failed": 0})[0] is True
+    assert _interpret_preheat_stats({"total": 1, "ok": 0, "skipped": 1, "failed": 1})[0] is False
+    assert _interpret_preheat_stats({"total": 1, "ok": 0, "skipped": 0, "failed": 1})[0] is False
+    ok, why = _interpret_preheat_stats({"total": 0, "ok": 0, "skipped": 0, "failed": 0})
+    assert ok is False and why, "空目标池应报明确原因"
+    print("  ✓ skipped 判定为成功（数据已最新）")
+
+
 def test_analysis_side_market_detection_matches_routers():
     """
     第三轮 Review 观察 2：分析链路（identify_stock_market）原先不认多字母
