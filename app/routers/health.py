@@ -53,6 +53,34 @@ async def readyz():
 # 缓存层/非真实 API 数据源类型，不视为可用数据源
 _CACHE_SOURCE_TYPES = {"local", "mongodb", "local_file"}
 
+# 就绪检查覆盖的市场（基础信息按市场分集合存放，见 app/core/market_codes 口径）
+_READINESS_MARKETS = ("cn", "hk", "us")
+
+
+async def count_basics_by_market(db) -> Dict[str, int]:
+    """
+    分市场统计基础信息集合的文档数。
+
+    就绪检查是**全局系统就绪**语义（首页引导卡片用，无市场上下文），而基础信息
+    按市场分集合存放（cn→`stock_basic_info` / hk→`_hk` / us→`_us`）。只数 A 股
+    集合会让港股/美股专用部署误报 `basics_synced=false`「基础数据未同步」——
+    与先前各轮修的是同一类「港美股被当成 A 股查」的问题（第六轮 Review 遗留 P3）。
+
+    口径：**任一市场有基础数据即视为已同步**；总量为三市场之和。
+    集合名一律走 `basic_info_collection()`，不在本处硬编码。
+    """
+    from app.core.market_codes import basic_info_collection
+
+    counts: Dict[str, int] = {}
+    for market in _READINESS_MARKETS:
+        try:
+            counts[market] = await db[basic_info_collection(market)].count_documents({})
+        except Exception as e:  # noqa: BLE001
+            # 单个市场统计失败不应让整个就绪检查报错，按 0 计并留痕
+            logger.warning(f"⚠️ 统计 {market} 基础信息失败（按 0 计）: {e}")
+            counts[market] = 0
+    return counts
+
 
 @router.get("/system/readiness", response_model=Dict[str, Any])
 async def system_readiness():
@@ -65,6 +93,8 @@ async def system_readiness():
         "basics_synced": False,
         "llm_configured": False,
         "basics_count": 0,
+        # 分市场基础信息计数（cn/hk/us），便于排查「就绪但某市场为空」
+        "basics_by_market": {},
         "enabled_real_sources": [],
         "enabled_llm_count": 0,
         "overall_ready": False,
@@ -81,11 +111,13 @@ async def system_readiness():
             readiness["llm_configured"] = True
             readiness["enabled_real_sources"] = ["tushare", "akshare"]
             readiness["enabled_llm_count"] = 1
-            # 仍需检查基础数据同步
+            # 仍需检查基础数据同步（按市场：任一市场有数据即视为已同步）
             from app.core.database import get_mongo_db
             db = get_mongo_db()
-            basics_count = await db["stock_basic_info"].count_documents({})
+            basics_by_market = await count_basics_by_market(db)
+            basics_count = sum(basics_by_market.values())
             readiness["basics_count"] = basics_count
+            readiness["basics_by_market"] = basics_by_market
             readiness["basics_synced"] = basics_count > 0
 
             # 京东云版只关心同步状态
@@ -125,11 +157,13 @@ async def system_readiness():
         readiness["enabled_llm_count"] = len(enabled_llms)
         readiness["llm_configured"] = len(enabled_llms) > 0
 
-        # ── 3. 检查基础数据同步 ──
+        # ── 3. 检查基础数据同步（按市场：任一市场有数据即视为已同步）──
         from app.core.database import get_mongo_db
         db = get_mongo_db()
-        basics_count = await db["stock_basic_info"].count_documents({})
+        basics_by_market = await count_basics_by_market(db)
+        basics_count = sum(basics_by_market.values())
         readiness["basics_count"] = basics_count
+        readiness["basics_by_market"] = basics_by_market
         readiness["basics_synced"] = basics_count > 0
 
         # ── 4. 计算总体就绪度和下一步建议 ──
