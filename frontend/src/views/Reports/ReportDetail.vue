@@ -54,14 +54,8 @@
                   <el-dropdown-item command="markdown">
                     <el-icon><document /></el-icon> Markdown
                   </el-dropdown-item>
-                  <el-dropdown-item command="docx">
-                    <el-icon><document /></el-icon> Word 文档
-                  </el-dropdown-item>
                   <el-dropdown-item command="pdf">
                     <el-icon><document /></el-icon> PDF
-                  </el-dropdown-item>
-                  <el-dropdown-item command="json" divided>
-                    <el-icon><document /></el-icon> JSON (原始数据)
                   </el-dropdown-item>
                 </el-dropdown-menu>
               </template>

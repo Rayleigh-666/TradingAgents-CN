@@ -2,11 +2,13 @@
 研究报告管理 API 路由
 """
 import os
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from .auth_db import get_current_user
@@ -602,5 +604,179 @@ async def delete_report(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 导出下载端点（Pro 专属，export_reports 门控）已拆分至 reports_export.py
-# 见 docs/05-design/v3.0/v3.6.0-community-edition-separation-plan.md §5.2
+# =============================================================================
+# 报告导出下载（社区版自建实现）
+#
+# 背景：v3.6.0 社区版分离时，导出下载端点原计划拆到 Pro 侧
+# （docs/05-design/v3.0/v3.6.0-community-edition-separation-plan.md §5.2），
+# 但对应模块 reports_export.py 从未落地 ⇒ 前端「下载报告」始终 404。
+# 此处提供社区版实现，支持 Markdown / PDF 两种格式：
+#   - Markdown：直接返回 report_exporter 生成的 .md 文本
+#   - PDF：走 report_exporter 的引擎链（WeasyPrint → pdfkit → 无头 Chrome）
+# 若 Pro 版重新引入导出路由，需在社区路由之前注册才能覆盖本实现
+# （router_registry 先注册 COMMUNITY_ROUTERS 再注册 PRO_ROUTERS）。
+# =============================================================================
+
+async def _fetch_task_result_for_export(
+    db, report_id: str, by_analysis_id: bool = False
+) -> Optional[Dict[str, Any]]:
+    """从任务中心（unified_analysis_tasks / analysis_tasks）取原始 result。"""
+    if by_analysis_id:
+        query: Dict[str, Any] = {
+            "$or": [{"task_id": report_id}, {"result.analysis_id": report_id}]
+        }
+    else:
+        query = {"task_id": report_id}
+
+    for coll in ("unified_analysis_tasks", "analysis_tasks"):
+        try:
+            task_doc = await db[coll].find_one(query, {"result": 1})
+        except Exception as e:
+            logger.warning(f"⚠️ 导出时查询 {coll} 失败: {e}")
+            continue
+        if task_doc and task_doc.get("result"):
+            return task_doc["result"]
+    return None
+
+
+async def _load_report_doc_for_export(db, report_id: str) -> Optional[Dict[str, Any]]:
+    """加载用于导出的报告文档（口径与 GET /{report_id}/detail 保持一致）。
+
+    1) 优先取 analysis_reports；
+    2) 用任务原始结果补齐可能缺失的报告模块（取更全的那份）；
+    3) 完全找不到时回退到任务中心还原一份最小可用文档。
+    返回 None 表示报告不存在。
+    """
+    doc = await db.analysis_reports.find_one(_build_report_query(report_id))
+
+    if doc:
+        doc["reports"] = _rebuild_report_modules(doc, doc.get("reports", {}))
+        task_id = doc.get("task_id")
+        if task_id:
+            result = await _fetch_task_result_for_export(db, task_id)
+            if result:
+                rebuilt = _rebuild_report_modules(result, doc.get("reports", {}))
+                if len(rebuilt) > len(doc.get("reports") or {}):
+                    doc["reports"] = rebuilt
+        return doc
+
+    # 兜底：报告只存在于任务中心
+    result = await _fetch_task_result_for_export(db, report_id, by_analysis_id=True)
+    if not result:
+        return None
+
+    logger.info(f"ℹ️ analysis_reports 未找到 {report_id}，已从任务中心还原用于导出")
+    return {
+        "analysis_id": result.get("analysis_id", report_id),
+        "task_id": result.get("task_id", report_id),
+        "stock_symbol": result.get("stock_symbol") or result.get("stock_code") or "",
+        "stock_name": result.get("stock_name"),
+        "analysis_date": result.get("analysis_date", ""),
+        "analysts": result.get("analysts", []),
+        "research_depth": result.get("research_depth", 1),
+        "summary": result.get("summary", ""),
+        "reports": _rebuild_report_modules(result),
+        "decision": result.get("decision", {}),
+        "status": "completed",
+    }
+
+
+def _build_export_filename(doc: Dict[str, Any], ext: str) -> str:
+    """构造下载文件名：股票代码_股票名称_分析报告_日期.ext"""
+    symbol = str(doc.get("stock_symbol") or doc.get("stock_code") or "report").strip()
+    name = doc.get("stock_name")
+    if _is_invalid_stock_name(symbol, name):
+        name = ""
+    # 移除文件名非法字符与空白
+    clean_name = re.sub(r'[\\/:*?"<>|\s]+', "", str(name)) if name else ""
+    date_part = str(doc.get("analysis_date") or "").strip().split(" ")[0]
+
+    parts = [symbol]
+    if clean_name:
+        parts.append(clean_name)
+    parts.append("分析报告")
+    if date_part:
+        parts.append(date_part)
+    return "_".join(p for p in parts if p) + f".{ext}"
+
+
+def _ascii_fallback_filename(filename: str, fallback: str) -> str:
+    """为 Content-Disposition 的 `filename=` 生成纯 ASCII 兜底名。
+
+    HTTP 头按 latin-1 编码（Starlette 会直接 `.encode("latin-1")`），
+    把中文名原样塞进 `filename="..."` 会抛 UnicodeEncodeError → 500。
+    因此中文真实名走 RFC 5987 的 `filename*=UTF-8''<百分号编码>`，
+    这里只保留 ASCII 部分作为老客户端兜底。
+    """
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
+    ascii_name = re.sub(r"_+", "_", ascii_name)                     # 合并连续下划线
+    ascii_name = re.sub(r"_+(\.[A-Za-z0-9]+)$", r"\1", ascii_name)  # 去掉扩展名前多余下划线
+    ascii_name = ascii_name.strip("_ ")
+    # 中文被全部剥掉后可能只剩 ".md" 这类无主名的形态（等于隐藏文件），回退兜底名
+    if not ascii_name or ascii_name.startswith("."):
+        return fallback
+    return ascii_name
+
+
+@router.get("/{report_id}/download")
+async def download_report(
+    report_id: str,
+    export_format: str = Query(
+        "markdown", alias="format", description="导出格式：markdown | pdf"
+    ),
+    user: dict = Depends(get_current_user),
+):
+    """导出并下载研究报告。
+
+    - `format=markdown` → 返回 `text/markdown` 文本（.md）
+    - `format=pdf`      → 返回 `application/pdf` 二进制
+    """
+    fmt = (export_format or "markdown").strip().lower()
+    if fmt in ("md", "markdown"):
+        fmt = "markdown"
+    if fmt not in ("markdown", "pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的导出格式：{export_format}（当前支持 markdown、pdf）",
+        )
+
+    try:
+        db = get_mongo_db()
+        doc = await _load_report_doc_for_export(db, report_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="报告不存在")
+
+        from ..utils.report_exporter import report_exporter
+
+        ext = "md" if fmt == "markdown" else "pdf"
+        filename = _build_export_filename(doc, ext)
+        # filename= 必须是纯 ASCII（HTTP 头按 latin-1 编码），
+        # 中文真实名走 RFC 5987 的 filename*=UTF-8''，两者并存以兼容各浏览器。
+        ascii_name = _ascii_fallback_filename(filename, f"report.{ext}")
+        disposition = (
+            f"attachment; filename=\"{ascii_name}\"; "
+            f"filename*=UTF-8''{quote(filename, safe='')}"
+        )
+
+        logger.info(f"⬇️ 导出报告: {report_id} 格式={fmt} 文件名={filename}")
+
+        if fmt == "markdown":
+            content = report_exporter.generate_markdown_report(doc)
+            return Response(
+                content=content.encode("utf-8"),
+                media_type="text/markdown; charset=utf-8",
+                headers={"Content-Disposition": disposition},
+            )
+
+        pdf_bytes = report_exporter.generate_pdf_report(doc)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": disposition},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ 导出报告失败: {report_id}/{fmt} - {e}")
+        raise HTTPException(status_code=500, detail=f"导出报告失败: {e}")

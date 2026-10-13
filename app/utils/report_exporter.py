@@ -12,6 +12,8 @@ PDF 导出需要额外工具:
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -154,6 +156,58 @@ except Exception as e:
     logger.warning(f"⚠️ pdfkit 检测失败: {e}")
 
 
+# 检查无头 Chrome / Chromium（社区版补位方案）
+# 优势：不需要 Homebrew / wkhtmltopdf / WeasyPrint 原生库，复用同一套 HTML+CSS，
+#       CJK（中文）渲染质量最佳。macOS 上绝大多数机器已装 Chrome。
+CHROME_AVAILABLE = False
+CHROME_BINARY: Optional[str] = None
+CHROME_ERROR: Optional[str] = None
+
+
+def _find_chrome_binary() -> Optional[str]:
+    """按常见安装位置查找 Chrome / Chromium / Edge / Brave 可执行文件。"""
+    candidates = [
+        os.getenv("CHROME_BINARY") or "",
+        os.getenv("CHROME_PATH") or "",
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    # 兜底：从 PATH 里找
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "chrome", "msedge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+try:
+    CHROME_BINARY = _find_chrome_binary()
+    if CHROME_BINARY:
+        CHROME_AVAILABLE = True
+        logger.info(f"✅ 无头 Chrome 可用（PDF 生成工具，无需额外依赖）: {CHROME_BINARY}")
+    else:
+        logger.info("ℹ️ 未找到 Chrome/Chromium，无头 Chrome PDF 方案不可用")
+except Exception as e:
+    CHROME_ERROR = str(e)
+    logger.warning(f"⚠️ Chrome 检测失败: {e}")
+
+
 class ReportExporter:
     """报告导出器 - 支持 Markdown、Word、PDF 格式"""
 
@@ -162,11 +216,13 @@ class ReportExporter:
         self.pandoc_available = PANDOC_AVAILABLE
         self.weasyprint_available = WEASYPRINT_AVAILABLE
         self.pdfkit_available = PDFKIT_AVAILABLE
+        self.chrome_available = CHROME_AVAILABLE
 
         logger.info("📋 ReportExporter 初始化:")
         logger.info(f"  - export_available: {self.export_available}")
         logger.info(f"  - pandoc_available: {self.pandoc_available}")
         logger.info(f"  - pdfkit_available: {self.pdfkit_available}")
+        logger.info(f"  - chrome_available: {self.chrome_available}")
 
     @staticmethod
     def _normalize_heading_text(text: str) -> str:
@@ -292,7 +348,8 @@ class ReportExporter:
         """生成 Markdown 格式报告"""
         logger.info("📝 生成 Markdown 报告...")
         
-        stock_symbol = report_doc.get("stock_symbol", "unknown")
+        stock_symbol = report_doc.get("stock_symbol") or report_doc.get("stock_code") or "unknown"
+        stock_name = report_doc.get("stock_name")
         analysis_date = report_doc.get("analysis_date", "")
         analysts = report_doc.get("analysts", [])
         research_depth = report_doc.get("research_depth", 1)
@@ -302,7 +359,19 @@ class ReportExporter:
         content_parts = []
         
         # 标题和元信息
-        content_parts.append(f"# {stock_symbol} 股票研究报告")
+        # 有真实股票名称时展示为「名称（代码）」，与前端报告页标题保持一致；
+        # 占位名（如 "股票000001"）不展示，避免导出标题出现脏数据。
+        display_symbol = str(stock_symbol).strip()
+        name_text = str(stock_name).strip() if stock_name else ""
+        placeholder_names = {
+            display_symbol,
+            f"股票{display_symbol}",
+            f"ETF{display_symbol}",
+        }
+        if name_text and name_text not in placeholder_names:
+            display_symbol = f"{name_text}（{display_symbol}）"
+
+        content_parts.append(f"# {display_symbol} 股票研究报告")
         content_parts.append("")
         content_parts.append(f"**研究日期**: {analysis_date}")
         if analysts:
@@ -759,7 +828,7 @@ pre, code {
         }}
 
         body {{
-            font-family: "Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial", sans-serif;
+            font-family: "Noto Sans CJK SC", "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", "SimHei", "Arial", sans-serif;
             line-height: 1.8;
             color: #333;
             margin: 20mm;
@@ -999,8 +1068,93 @@ pre, code {
         logger.info(f"✅ PDF 生成成功，大小: {len(pdf_bytes)} 字节")
         return pdf_bytes
 
+    def _generate_pdf_with_chrome(self, html_content: str) -> bytes:
+        """使用无头 Chrome / Chromium 将 HTML 打印为 PDF。
+
+        社区版补位方案：不需要 Homebrew / wkhtmltopdf / WeasyPrint 原生库，
+        直接复用 WeasyPrint 那套 HTML+CSS（Chrome 支持的 CSS 是超集），
+        且中文（CJK）渲染质量最好。
+
+        实现方式：把 HTML 写入临时文件，用 `--print-to-pdf` 输出到临时文件再读回。
+        使用独立的 --user-data-dir，避免污染用户日常 Chrome 配置。
+        """
+        if not CHROME_AVAILABLE or not CHROME_BINARY:
+            raise Exception("未找到 Chrome/Chromium 可执行文件")
+
+        tmpdir = tempfile.mkdtemp(prefix="ta_pdf_")
+        try:
+            html_path = os.path.join(tmpdir, "report.html")
+            pdf_path = os.path.join(tmpdir, "report.pdf")
+            profile_dir = os.path.join(tmpdir, "chrome-profile")
+
+            # Chrome 不支持 CSS `@page` 的页眉页脚（margin box），且 body 的 20mm
+            # margin 会与 @page 的 20mm 叠加成 40mm。用一段覆盖样式修正版心。
+            chrome_override = (
+                '<style id="ta-chrome-pdf-override">'
+                "  @page { margin: 18mm; }"
+                "  body { margin: 0 !important; }"
+                "</style>"
+            )
+            if "</head>" in html_content:
+                html_content = html_content.replace("</head>", chrome_override + "</head>", 1)
+            else:
+                html_content = chrome_override + html_content
+
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+            base_flags = [
+                "--disable-gpu",
+                "--no-sandbox",
+                "--no-pdf-header-footer",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--run-all-compositor-stages-before-draw",
+                "--virtual-time-budget=15000",
+                f"--user-data-dir={profile_dir}",
+                f"--print-to-pdf={pdf_path}",
+                Path(html_path).as_uri(),
+            ]
+
+            logger.info("🔧 使用无头 Chrome 生成 PDF...")
+            last_error = ""
+            # Chrome 112+ 用 --headless=new；更老的版本只认 --headless
+            for headless_flag in ("--headless=new", "--headless"):
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+                try:
+                    proc = subprocess.run(
+                        [CHROME_BINARY, headless_flag, *base_flags],
+                        capture_output=True,
+                        timeout=180,
+                    )
+                except subprocess.TimeoutExpired:
+                    last_error = f"{headless_flag} 超时（180s）"
+                    logger.warning(f"⚠️ 无头 Chrome {last_error}")
+                    continue
+
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    with open(pdf_path, "rb") as f:
+                        pdf_bytes = f.read()
+                    logger.info(f"✅ 无头 Chrome 生成 PDF 成功，大小: {len(pdf_bytes)} 字节")
+                    return pdf_bytes
+
+                stderr = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+                last_error = f"{headless_flag} 未产出 PDF（exit={proc.returncode}）{stderr[-500:]}"
+                logger.warning(f"⚠️ 无头 Chrome 生成失败: {last_error}")
+
+            raise Exception(last_error or "无头 Chrome 未能生成 PDF")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def generate_pdf_report(self, report_doc: Dict[str, Any]) -> bytes:
-        """生成 PDF 格式报告（优先使用 WeasyPrint，否则使用 pdfkit）"""
+        """生成 PDF 格式报告。
+
+        按可用性依次尝试：WeasyPrint → pdfkit(wkhtmltopdf) → 无头 Chrome。
+        任一引擎成功即返回；全部失败时抛出带有每个引擎失败原因的异常。
+        """
         logger.info("📊 开始生成 PDF 文档...")
 
         # 生成 Markdown 内容
@@ -1009,35 +1163,43 @@ pre, code {
         md_content = self._replace_emoji_for_pdf(md_content)
         html_content = self._markdown_to_html(md_content)
 
-        # 优先使用 WeasyPrint（推荐，纯 Python，无需外部工具）
+        engines = []
         if self.weasyprint_available:
-            try:
-                logger.info("🎯 使用 WeasyPrint 生成 PDF（推荐）")
-                return self._generate_pdf_with_weasyprint(html_content)
-            except Exception as e:
-                logger.warning(f"⚠️ WeasyPrint 生成失败: {e}，尝试使用 pdfkit...")
-                # 如果 WeasyPrint 失败，尝试 pdfkit
-
-        # 备选方案：使用 pdfkit
+            engines.append(("WeasyPrint", self._generate_pdf_with_weasyprint))
         if self.pdfkit_available:
-            try:
-                logger.info("🎯 使用 pdfkit + wkhtmltopdf 生成 PDF（备选）")
-                return self._generate_pdf_with_pdfkit(html_content)
-            except Exception as e:
-                logger.error(f"❌ pdfkit 生成失败: {e}")
-                raise Exception(f"PDF 生成失败: {e}")
+            engines.append(("pdfkit + wkhtmltopdf", self._generate_pdf_with_pdfkit))
+        if self.chrome_available:
+            engines.append(("无头 Chrome", self._generate_pdf_with_chrome))
 
-        # 如果都不可用，抛出错误
+        engine_errors = []
+        for label, generate in engines:
+            try:
+                logger.info(f"🎯 尝试使用 {label} 生成 PDF...")
+                pdf_bytes = generate(html_content)
+                if pdf_bytes:
+                    return pdf_bytes
+                engine_errors.append(f"{label}: 返回空内容")
+            except Exception as e:
+                logger.warning(f"⚠️ {label} 生成失败: {e}")
+                engine_errors.append(f"{label}: {e}")
+
+        # 所有引擎都失败
         error_msg = (
-            "PDF 生成工具不可用，无法生成 PDF。\n\n"
-            "推荐安装方法（任选其一）:\n"
-            "1. WeasyPrint（推荐，纯 Python，无需外部工具）: pip install weasyprint\n"
-            "2. pdfkit + wkhtmltopdf: pip install pdfkit，然后安装 https://wkhtmltopdf.org/downloads.html\n"
+            "PDF 生成失败：没有可用的 PDF 引擎。\n\n"
+            "可选方案（任选其一）:\n"
+            "1. 安装 Google Chrome / Chromium（无需额外依赖，中文渲染最佳）\n"
+            "2. WeasyPrint（纯 Python）: pip install weasyprint\n"
+            "3. pdfkit + wkhtmltopdf: pip install pdfkit，"
+            "再装 https://wkhtmltopdf.org/downloads.html\n"
         )
         if WEASYPRINT_ERROR:
             error_msg += f"\nWeasyPrint 错误: {WEASYPRINT_ERROR}\n"
         if PDFKIT_ERROR:
-            error_msg += f"\npdfkit 错误: {PDFKIT_ERROR}"
+            error_msg += f"\npdfkit 错误: {PDFKIT_ERROR}\n"
+        if CHROME_ERROR:
+            error_msg += f"\nChrome 错误: {CHROME_ERROR}\n"
+        if engine_errors:
+            error_msg += "\n尝试记录:\n" + "\n".join(f"- {e}" for e in engine_errors)
 
         logger.error(f"❌ {error_msg}")
         raise Exception(error_msg)
