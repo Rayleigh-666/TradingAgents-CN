@@ -13,6 +13,7 @@ from datetime import datetime
 
 from app.models.analysis import UnifiedAnalysisTask, AnalysisTaskType, AnalysisStatus
 from app.services.workflow_registry import AnalysisWorkflowRegistry
+from app.utils.api_key_utils import is_valid_api_key
 from app.utils.timezone import now_tz
 from core.workflow.default_workflow_provider import get_default_workflow_provider
 
@@ -285,16 +286,26 @@ class UnifiedAnalysisEngine:
         provider_doc = await db.llm_providers.find_one({"name": provider_name})
 
         # 🔥 确定 API Key（优先级：模型配置 > 厂家配置 > 环境变量）
+        # 守卫统一走 is_valid_api_key：会拒绝 your_*、*_here、sk-xxx、changeme
+        # 等占位符，避免把 .env 里的模板值当有效 Key 发出去（历史 401 根因）
         api_key = None
         model_api_key = model_config.get("api_key", "")
-        if model_api_key and model_api_key.strip() and model_api_key != "your-api-key" and not model_api_key.startswith("sk-xxx"):
+        if is_valid_api_key(model_api_key):
             api_key = model_api_key
             self.logger.info(f"✅ [LLM配置] 使用模型配置的 API Key")
-        elif provider_doc:
+        elif model_api_key:
+            self.logger.warning(
+                f"⚠️ [LLM配置] 模型配置（{target_model}）的 API Key 是占位符/无效值，已忽略并继续回退"
+            )
+        if not api_key and provider_doc:
             provider_api_key = provider_doc.get("api_key", "")
-            if provider_api_key and provider_api_key.strip() and provider_api_key != "your-api-key" and not provider_api_key.startswith("sk-xxx"):
+            if is_valid_api_key(provider_api_key):
                 api_key = provider_api_key
                 self.logger.info(f"✅ [LLM配置] 使用厂家配置的 API Key")
+            elif provider_api_key:
+                self.logger.warning(
+                    f"⚠️ [LLM配置] 厂家 {provider_name} 的 API Key 是占位符/无效值，已忽略"
+                )
         
         backend_url = model_config.get("api_base", "")
         if provider_doc and not backend_url:
@@ -313,7 +324,13 @@ class UnifiedAnalysisEngine:
             }
             env_name = env_key_map.get(provider_name.lower())
             if env_name:
-                api_key = os.getenv(env_name)
+                env_api_key = os.getenv(env_name)
+                if env_api_key and not is_valid_api_key(env_api_key):
+                    self.logger.warning(
+                        f"⚠️ [LLM配置] 环境变量 {env_name} 是占位符/无效值，已忽略"
+                    )
+                else:
+                    api_key = env_api_key
 
         # 🔥 获取快速模型配置
         quick_model_config = None
@@ -344,30 +361,36 @@ class UnifiedAnalysisEngine:
             deep_provider_name = deep_model_config.get("provider", provider_name)
             # 🔥 确定深度模型的 API Key（优先级：模型配置 > 厂家配置 > 环境变量）
             deep_model_api_key = deep_model_config.get("api_key", "")
-            if deep_model_api_key and deep_model_api_key.strip() and deep_model_api_key != "your-api-key" and not deep_model_api_key.startswith("sk-xxx"):
+            if is_valid_api_key(deep_model_api_key):
                 deep_api_key = deep_model_api_key
                 self.logger.info(f"✅ [LLM配置] 深度模型使用模型配置的 API Key")
             elif deep_provider_name != provider_name:
                 deep_provider_doc = await db.llm_providers.find_one({"name": deep_provider_name})
                 if deep_provider_doc:
                     deep_provider_api_key = deep_provider_doc.get("api_key", "")
-                    if deep_provider_api_key and deep_provider_api_key.strip() and deep_provider_api_key != "your-api-key" and not deep_provider_api_key.startswith("sk-xxx"):
+                    if is_valid_api_key(deep_provider_api_key):
                         deep_api_key = deep_provider_api_key
                         self.logger.info(f"✅ [LLM配置] 深度模型使用厂家配置的 API Key")
                     deep_backend_url = deep_model_config.get("api_base", "") or deep_provider_doc.get("default_base_url", "")
-            if not deep_api_key or deep_api_key.startswith("sk-xxx"):
-                        import os
-                        env_key_map = {
-                            "openai": "OPENAI_API_KEY",
-                            "deepseek": "DEEPSEEK_API_KEY",
-                            "dashscope": "DASHSCOPE_API_KEY",
-                            "google": "GOOGLE_API_KEY",
-                            "zhipu": "ZHIPU_API_KEY",
-                            "siliconflow": "SILICONFLOW_API_KEY",
-                        }
-                        env_name = env_key_map.get(deep_provider_name.lower())
-                        if env_name:
-                            deep_api_key = os.getenv(env_name) or deep_api_key
+            if not is_valid_api_key(deep_api_key):
+                import os
+                env_key_map = {
+                    "openai": "OPENAI_API_KEY",
+                    "deepseek": "DEEPSEEK_API_KEY",
+                    "dashscope": "DASHSCOPE_API_KEY",
+                    "google": "GOOGLE_API_KEY",
+                    "zhipu": "ZHIPU_API_KEY",
+                    "siliconflow": "SILICONFLOW_API_KEY",
+                }
+                env_name = env_key_map.get(deep_provider_name.lower())
+                if env_name:
+                    env_api_key = os.getenv(env_name)
+                    if env_api_key and not is_valid_api_key(env_api_key):
+                        self.logger.warning(
+                            f"⚠️ [LLM配置] 环境变量 {env_name} 是占位符/无效值，已忽略"
+                        )
+                    elif env_api_key:
+                        deep_api_key = env_api_key
             else:
                 deep_backend_url = deep_model_config.get("api_base", "") or backend_url
         

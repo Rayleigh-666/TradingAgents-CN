@@ -125,35 +125,22 @@ class StartupValidator:
         """
         判断 API Key 是否有效（不是占位符）
 
+        统一委托给 app.utils.api_key_utils.is_valid_api_key（全项目唯一口径），
+        本方法只额外保留「去除首尾引号」的环境变量取值习惯。
+
         Args:
             api_key: 待验证的 API Key
 
         Returns:
             bool: True 表示有效，False 表示无效或占位符
         """
+        from app.utils.api_key_utils import is_valid_api_key
+
         if not api_key:
             return False
 
-        # 去除首尾空格和引号
-        api_key = api_key.strip().strip('"').strip("'")
-
-        # 检查是否为空
-        if not api_key:
-            return False
-
-        # 检查是否为占位符（前缀）
-        if api_key.startswith('your_') or api_key.startswith('your-'):
-            return False
-
-        # 检查是否为占位符（后缀）
-        if api_key.endswith('_here') or api_key.endswith('-here'):
-            return False
-
-        # 检查长度（允许较短的测试 Key，但仍需排除明显无效值）
-        if len(api_key) < 5:
-            return False
-
-        return True
+        # 去除首尾空格和引号（.env 里常见 KEY="xxxx" 的写法）
+        return is_valid_api_key(api_key.strip().strip('"').strip("'"))
 
     def validate(self) -> ValidationResult:
         """

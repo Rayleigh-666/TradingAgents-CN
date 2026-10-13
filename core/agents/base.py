@@ -667,6 +667,22 @@ class BaseAgent(ABC):
 
     # ========== v2.0: 标准化工具调用循环处理 ==========
 
+    def _llm_failure_message(self, retry_count: int, error_msg: str) -> str:
+        """构造 LLM 调用失败的异常消息。
+
+        带上模型名，便于工作流降级文案 / 日志直接定位「是哪个模型失败了」。
+        历史问题：异常只带原始 error_msg，界面降级文案又只打印异常类型名，
+        结果只剩「错误摘要: ValueError」，真正的 401 被层层吞掉。
+        """
+        model_label = ""
+        for attr in ("model_name", "model"):
+            value = getattr(self._llm, attr, None)
+            if value:
+                model_label = str(value)
+                break
+        model_suffix = f"，模型 {model_label}" if model_label else ""
+        return f"LLM API 调用失败（已重试 {retry_count} 次{model_suffix}）: {error_msg}"
+
     def invoke_with_tools(
         self,
         messages: List,
@@ -900,7 +916,7 @@ class BaseAgent(ABC):
                             elif hasattr(self._llm, 'base_url'):
                                 logger.error(f"   API Base: {self._llm.base_url}")
                         
-                        raise ValueError(f"LLM API 调用失败（已重试 {retry_count} 次）: {error_msg}") from last_error
+                        raise ValueError(self._llm_failure_message(retry_count, error_msg)) from last_error
 
             # 打印响应详情
             logger.info(f"=" * 100)
@@ -1032,7 +1048,7 @@ class BaseAgent(ABC):
                                 elif hasattr(self._llm, 'base_url'):
                                     logger.error(f"   API Base: {self._llm.base_url}")
                             
-                            raise ValueError(f"LLM API 调用失败（已重试 {retry_count} 次）: {error_msg}") from last_error
+                            raise ValueError(self._llm_failure_message(retry_count, error_msg)) from last_error
 
                 # 打印最终响应详情
                 logger.info(f"=" * 100)
@@ -1165,7 +1181,7 @@ class BaseAgent(ABC):
                                     elif hasattr(self._llm, 'base_url'):
                                         logger.error(f"   API Base: {self._llm.base_url}")
                                 
-                                raise ValueError(f"LLM API 调用失败（已重试 {retry_count} 次）: {error_msg}") from last_error
+                                raise ValueError(self._llm_failure_message(retry_count, error_msg)) from last_error
 
                     # 打印重试响应详情
                     logger.info(f"=" * 100)

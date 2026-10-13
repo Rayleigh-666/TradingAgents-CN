@@ -25,6 +25,21 @@ from typing import List, Optional, Tuple, Dict, Any
 logger = logging.getLogger(__name__)
 
 
+def _is_usable_api_key(api_key: str) -> bool:
+    """统一口径判断 Embedding 厂家的 Key 是否可用。
+
+    必须走 `app.utils.api_key_utils.is_valid_api_key`，**禁止**在业务侧自写
+    「不为空」「不等于 your-api-key」这类窄判断——历史 bug 正是这样放行了
+    `.env` 模板值 `your_dashscope_api_key_here`，导致每次 Embedding 调用都
+    401，连续 3 次后触发熔断、索引构建被跳过。
+
+    延迟导入以避免启动期的模块级依赖顺序问题。
+    """
+    from app.utils.api_key_utils import is_valid_api_key
+
+    return is_valid_api_key(api_key)
+
+
 # 🔥 Embedding 模型维度映射表
 EMBEDDING_DIMENSIONS = {
     # DashScope (阿里云)
@@ -125,19 +140,34 @@ class EmbeddingManager:
         if name == "local":
             return False
 
-        # 本地 HTTP 服务（Ollama）：检查 /v1/models 端点是否返回有效响应
-        if name == "ollama" and base_url:
+        # 统一口径：本地服务 = 名字白名单 或 地址指向本机（不再只认 ollama）
+        from app.utils.api_key_utils import is_local_service, is_valid_api_key
+
+        # 本地 HTTP 服务（Ollama / LM Studio / oMLX / vLLM 等）：
+        # 检查 /v1/models 端点是否可达。本地服务**通常**免 API Key，但有些
+        # （如 oMLX 默认开启鉴权）要求 Bearer Key，故配了有效 Key 就一并带上。
+        if is_local_service(name, base_url) and base_url:
             import urllib.request
             try:
                 models_url = base_url.rstrip("/") + "/models"
                 req = urllib.request.Request(models_url, method="GET")
+                local_key = provider_info.get("api_key") or ""
+                if is_valid_api_key(local_key):
+                    req.add_header("Authorization", f"Bearer {local_key}")
                 with urllib.request.urlopen(req, timeout=2) as resp:
                     if resp.status != 200:
                         logger.info(f"🔌 {provider_info['display_name']} /v1/models 返回 {resp.status}，跳过")
                         return False
                 return True
             except Exception as e:
-                logger.info(f"🔌 {provider_info['display_name']} 服务不可达 ({base_url})，跳过: {e}")
+                code = getattr(e, "code", None)
+                if code in (401, 403):
+                    logger.info(
+                        f"🔌 {provider_info['display_name']} /v1/models 返回 {code}"
+                        f"（服务要求 API Key，请在对应 provider 记录里填写），跳过"
+                    )
+                else:
+                    logger.info(f"🔌 {provider_info['display_name']} 服务不可达 ({base_url})，跳过: {e}")
                 return False
 
         # 云端模型：检查 API Key
@@ -231,16 +261,24 @@ class EmbeddingManager:
                 preferred_model = parts[1]
                 logger.info(f"🎯 优先使用系统配置的 Embedding 模型: {preferred_provider_name}:{preferred_model}")
             
+            from app.utils.api_key_utils import is_local_service
+
             for provider_doc in provider_docs:
                 provider_name = provider_doc.get("name", "").lower()
                 api_key = provider_doc.get("api_key", "")
                 base_url = provider_doc.get("default_base_url") or provider_doc.get("base_url", "")
                 embedding_model = provider_doc.get("embedding_model", "")
 
-                # 🔥 本地 HTTP 服务（ollama/localai）不需要 API Key
-                is_local_provider = provider_name in ["ollama", "localai"]
-                if not api_key and not is_local_provider:
-                    logger.debug(f"⚠️ {provider_name} 未配置 API Key，跳过")
+                # 🔥 本地服务（名字白名单 或 地址指向本机）不需要 API Key；
+                # 云端厂商的 Key 必须过统一口径校验（空值 / 占位符一律视为未配置）
+                is_local_provider = is_local_service(provider_name, base_url)
+                if is_local_provider:
+                    pass
+                elif not _is_usable_api_key(api_key):
+                    logger.warning(
+                        f"⚠️ {provider_doc.get('display_name', provider_name)} 未配置有效 API Key"
+                        f"（空值或占位符），跳过"
+                    )
                     continue
 
                 # 🔥 如果系统配置了该厂商的模型，优先使用系统配置
@@ -342,20 +380,26 @@ class EmbeddingManager:
                 self._providers.append(provider_info)
                 logger.debug(f"📋 加载 Embedding 提供商: {config['display_name']} (本地模型)")
             else:
-                # 云端模型需要 API Key
+                # 云端模型需要 API Key（必须非空且非占位符）
                 api_key = os.getenv(config["env_key"])
-                if api_key:
-                    provider_info = {
-                        "name": config["name"],
-                        "api_key": api_key,
-                        "base_url": config["base_url"],
-                        "model": config["model"],
-                        "display_name": config["display_name"]
-                    }
-                    # 🔥 预检查已在 api_key 非空时通过
-                    self._providers.append(provider_info)
-                    logger.debug(f"📋 加载 Embedding 提供商: {config['display_name']}")
-        
+                if not api_key:
+                    logger.debug(f"🔑 {config['display_name']} 环境变量 {config['env_key']} 未设置，跳过")
+                    continue
+                if not _is_usable_api_key(api_key):
+                    logger.warning(
+                        f"⚠️ {config['display_name']} 环境变量 {config['env_key']} 为占位符（非真实 Key），跳过"
+                    )
+                    continue
+                provider_info = {
+                    "name": config["name"],
+                    "api_key": api_key,
+                    "base_url": config["base_url"],
+                    "model": config["model"],
+                    "display_name": config["display_name"]
+                }
+                # 🔥 云端厂商的可用性已在统一口径校验（非空且非占位符）时确认
+                self._providers.append(provider_info)
+                logger.debug(f"📋 加载 Embedding 提供商: {config['display_name']}")        
         # 设置主提供商和备用提供商
         if self._providers:
             self._primary_provider = self._providers[0]
@@ -489,7 +533,7 @@ class EmbeddingManager:
         try:
             if provider_name == "dashscope":
                 return self._call_dashscope(provider, text)
-            elif provider_name in ["openai", "deepseek", "zhipu", "ollama", "localai", "jdyun", "volcengine", "volcengine_coding", "siliconflow", "kimi", "aihubmix", "xiaomi"]:
+            elif provider_name in ["openai", "deepseek", "zhipu", "ollama", "localai", "jdyun", "volcengine", "volcengine_coding", "siliconflow", "kimi", "aihubmix", "xiaomi", "omlx", "lmstudio", "vllm", "sglang"]:
                 # 🔥 OpenAI 兼容的 API（包括智谱AI、DeepSeek、京东云、本地模型等）
                 # 智谱AI 使用 OpenAI 兼容的 API，base_url: https://open.bigmodel.cn/api/paas/v4
                 return self._call_openai_compatible(provider, text)

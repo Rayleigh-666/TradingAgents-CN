@@ -46,6 +46,7 @@ _DEFAULT_EMBEDDING_MODELS = {
     "openrouter": "text-embedding-3-small",
     "localai": "text-embedding-3-small",
     "lmstudio": "text-embedding-3-small",
+    "omlx": "bge-m3",
 }
 
 
@@ -283,6 +284,20 @@ def _normalize_openai_base_url(base_url: str) -> str:
     return f"{normalized.rstrip('/')}/v1"
 
 
+def _normalize_ollama_host(base_url: str) -> str:
+    """把 provider 的 OpenAI 兼容地址转成 mem0 ollama 客户端需要的 host。
+
+    mem0 的 `OllamaEmbedding` 直接用 `ollama.Client(host=...)`，再由客户端拼
+    `/api/embed`。而本项目 llm_providers 里 ollama 的 `default_base_url` 是
+    `http://localhost:11434/v1`（给 OpenAI 兼容接口用的），原样传给 mem0 会变成
+    `http://localhost:11434/v1/api/embed` → 404。此处统一剥掉结尾的 `/v1`。
+    """
+    host = (base_url or "").strip().rstrip("/")
+    if host.endswith("/v1"):
+        host = host[: -len("/v1")].rstrip("/")
+    return host or "http://localhost:11434"
+
+
 def _parse_default_embedding_model(db_settings: dict) -> Tuple[str, str]:
     default_emb = str(db_settings.get("default_embedding_model") or "").strip()
     if not default_emb or ":" not in default_emb:
@@ -305,16 +320,32 @@ def _get_embedding_provider_candidates(sync_db) -> list:
         return []
 
 
-def _resolve_mem0_provider(provider_name: str) -> Optional[str]:
+def _resolve_mem0_provider(provider_name: str, base_url: str = "") -> Optional[str]:
+    """把厂家名映射成 mem0 支持的 embedder provider。
+
+    已知的 OpenAI 兼容厂家走 `openai`；ollama / gemini 走 mem0 原生实现；
+    其余**本地服务**（名字白名单或地址指向本机，如 oMLX / vLLM）也按 OpenAI
+    兼容端点处理——它们都提供标准的 `/v1/embeddings`。
+    """
     normalized = (provider_name or "").strip().lower()
     if normalized in _MEM0_OPENAI_COMPATIBLE_PROVIDERS:
         return "openai"
-    return _MEM0_DIRECT_PROVIDER_MAP.get(normalized)
+    mapped = _MEM0_DIRECT_PROVIDER_MAP.get(normalized)
+    if mapped:
+        return mapped
+
+    # 兜底：未登记的本地服务（oMLX / vLLM / SGLang 等）按 OpenAI 兼容端点处理
+    from app.utils.api_key_utils import is_local_service
+
+    if is_local_service(normalized, base_url):
+        return "openai"
+    return None
 
 
 def _build_embedder_config_from_provider_doc(provider_doc: dict, model_name: str) -> dict:
     provider_name = str(provider_doc.get("name") or "").strip().lower()
-    mem0_provider = _resolve_mem0_provider(provider_name)
+    base_url = str(provider_doc.get("default_base_url") or provider_doc.get("base_url") or "").strip()
+    mem0_provider = _resolve_mem0_provider(provider_name, base_url)
     if not mem0_provider:
         return {}
 
@@ -330,21 +361,30 @@ def _build_embedder_config_from_provider_doc(provider_doc: dict, model_name: str
     }
 
     api_key = str(provider_doc.get("api_key") or "").strip()
-    base_url = str(provider_doc.get("default_base_url") or provider_doc.get("base_url") or "").strip()
+
+    # 统一口径：空值 / 占位符（如 .env 模板值 your_xxx_api_key_here）一律视为未配置
+    from app.utils.api_key_utils import is_valid_api_key, is_local_service
+
+    # 本地服务（名字白名单 或 地址指向本机）免 API Key：DB 里没填 Key 也允许接入。
+    # mem0 的 openai 客户端要求 key 非空，故补一个不会被识别为占位符的本地占位值。
+    is_local = is_local_service(provider_name, base_url)
 
     if mem0_provider == "openai":
-        if not api_key:
-            return {}
-        config["api_key"] = api_key
+        if is_local:
+            config["api_key"] = api_key if is_valid_api_key(api_key) else "sk-local"
+        else:
+            if not is_valid_api_key(api_key):
+                return {}
+            config["api_key"] = api_key
         config["openai_base_url"] = _normalize_openai_base_url(base_url)
     elif mem0_provider == "gemini":
-        if not api_key:
+        if not is_valid_api_key(api_key):
             return {}
         config["api_key"] = api_key
         if not selected_model.startswith("models/"):
             config["model"] = f"models/{selected_model}"
     elif mem0_provider == "ollama":
-        config["ollama_base_url"] = base_url or "http://localhost:11434"
+        config["ollama_base_url"] = _normalize_ollama_host(base_url)
 
     return {
         "provider": mem0_provider,
@@ -354,6 +394,8 @@ def _build_embedder_config_from_provider_doc(provider_doc: dict, model_name: str
 
 def _build_mem0_llm_config_from_unified_config(llm_config: Any) -> dict:
     """将统一 LLMConfig 转换为 mem0 所需的 LLM 配置。"""
+    from app.utils.api_key_utils import is_local_service
+
     provider_name = str(getattr(llm_config, "provider", "") or "").strip().lower()
     model_name = str(getattr(llm_config, "model", "") or "").strip() or "deepseek-chat"
     api_key = str(getattr(llm_config, "api_key", "") or "").strip()
@@ -372,6 +414,9 @@ def _build_mem0_llm_config_from_unified_config(llm_config: Any) -> dict:
     }
 
     if mem0_provider == "openai":
+        # 本地服务免 Key（mem0 的 openai 客户端要求 key 非空，补本地占位值）
+        if not api_key and is_local_service(provider_name, base_url):
+            api_key = "sk-local"
         config["api_key"] = api_key
         if base_url:
             config["openai_base_url"] = _normalize_openai_base_url(base_url)
@@ -380,7 +425,7 @@ def _build_mem0_llm_config_from_unified_config(llm_config: Any) -> dict:
         if not model_name.startswith("models/"):
             config["model"] = f"models/{model_name}"
     else:
-        config["ollama_base_url"] = base_url or "http://localhost:11434"
+        config["ollama_base_url"] = _normalize_ollama_host(base_url)
 
     return {
         "provider": mem0_provider,

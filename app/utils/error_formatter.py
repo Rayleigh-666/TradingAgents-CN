@@ -5,7 +5,7 @@
 """
 
 import re
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from enum import Enum
 
 
@@ -426,4 +426,130 @@ class ErrorFormatter:
                 ),
                 "technical_detail": original_error
             }
+
+
+# ---------------------------------------------------------------------------
+# 节点失败降级文案：把「真实错误摘要」带进报告（脱敏 + 折叠空白 + 截断）
+#
+# 历史问题：工作流节点的 except 分支只把 type(exc).__name__ 写进降级文案，
+# 界面只显示「错误摘要: ValueError」，真正的 401 invalid_api_key / 超时
+# 等原因被吞掉，用户完全无法定位。以下工具函数负责把真实原因（脱敏后）
+# 安全地带到用户可见的文案里。
+# ---------------------------------------------------------------------------
+
+# 单条降级文案里错误摘要的最大长度
+DEGRADED_ERROR_MAX_LEN = 400
+
+_SECRET_PATTERNS = (
+    # sk-ABCDEF...（OpenAI / DeepSeek 等常见密钥形态）
+    (re.compile(r"(?i)\bsk-[A-Za-z0-9_\-]{6,}\b"), "sk-***"),
+    # Bearer <token>
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{6,}"), "Bearer ***"),
+    # api_key=xxxx / token: xxxx / secret = "xxxx"
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|"
+            r"token|secret|password|passwd)\b\s*[:=]?\s*[\"']?([A-Za-z0-9_\-\.]{8,})[\"']?"
+        ),
+        r"\1=***",
+    ),
+)
+
+
+def redact_secrets(text: Optional[str]) -> str:
+    """把文本中疑似密钥 / token 的内容替换为 ***，避免泄漏到报告与前端。"""
+    if not text:
+        return ""
+
+    redacted = str(text)
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def summarize_error(error: Any, max_len: int = DEGRADED_ERROR_MAX_LEN) -> str:
+    """把异常 / 错误文本压成一行可展示摘要：脱敏 + 折叠空白 + 截断。
+
+    输入 ValueError("LLM API 调用失败（已重试 3 次）: Error code: 401 ...") 时
+    输出的是含 401 原文的一行摘要，而不是只有 "ValueError"。
+
+    Args:
+        error: 异常对象或错误文本
+        max_len: 摘要最大长度，超出则截断并加省略号；<=0 表示不截断
+
+    Returns:
+        str: 单行错误摘要
+    """
+    text = error if isinstance(error, str) else str(error)
+    text = redact_secrets(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if max_len and max_len > 0 and len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
+    return text
+
+
+def _degraded_error_hint(raw_error: str) -> str:
+    """根据原始错误文本给出一句可操作的中文提示（面向用户）。"""
+    low = (raw_error or "").lower()
+
+    if any(k in low for k in (
+        "invalid_api_key", "incorrect api key", "invalid api key",
+        "unauthorized", "authentication", "401",
+    )):
+        return "大模型 API Key 无效或未配置，请在「系统设置 → 模型配置」检查对应厂家的 Key 是否已正确填写。"
+
+    if any(k in low for k in (
+        "insufficient_quota", "insufficient balance", "quota", "rate limit",
+        "too many requests", "429", "余额", "欠费",
+    )):
+        return "大模型额度不足或被限流，请检查账户余额 / 套餐配额，或稍后重试。"
+
+    if any(k in low for k in (
+        "timeout", "timed out", "connection", "network", "unreachable", "ssl", "dns",
+    )):
+        return "与大模型服务连接失败（超时 / 网络异常），请检查网络或稍后重试。"
+
+    if any(k in low for k in (
+        "data_inspection_failed", "content filter", "content policy", "内容审核", "敏感内容",
+    )):
+        return "触发了大模型的内容审核，可尝试切换其它模型。"
+
+    return ""
+
+
+def build_node_failure_message(node_label: str, error: Any) -> str:
+    """构造「节点执行失败」的降级文案。
+
+    关键：**带上真实错误摘要**（脱敏、截断），而不是只写异常类型名。
+    历史问题：此处只输出 ``type(exc).__name__``，界面只看到
+    「错误摘要: ValueError」，真正的 401 invalid_api_key 被吞掉。
+
+    Args:
+        node_label: 节点展示名，例如「基本面分析师 v2.0」
+        error: 捕获到的异常对象或错误文本
+
+    Returns:
+        str: 可直接写入报告字段的降级文案
+    """
+    raw = error if isinstance(error, str) else str(error)
+    error_type = type(error).__name__ if isinstance(error, BaseException) else "Error"
+
+    lines = [
+        f"[{node_label} 执行失败]",
+        "",
+        "该分析节点在运行过程中遇到错误，已跳过。",
+        f"错误类型: {error_type}",
+        f"错误摘要: {summarize_error(raw) or '(无)'}",
+    ]
+
+    hint = _degraded_error_hint(raw)
+    if hint:
+        lines.append(f"可能原因: {hint}")
+
+    lines.extend([
+        "",
+        "其余节点的分析结果不受影响，请参考其他报告。",
+    ])
+    return "\n".join(lines)
 

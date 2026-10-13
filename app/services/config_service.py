@@ -4091,11 +4091,12 @@ class ConfigService:
         """
         判断 API Key 是否有效
 
-        有效条件：
-        1. Key 不为空
-        2. Key 不是占位符（不以 'your_' 或 'your-' 开头，不以 '_here' 结尾）
-        3. Key 不是截断的密钥（不包含 '...'）
-        4. Key 长度 > 10（基本的格式验证）
+        统一委托给 app.utils.api_key_utils.is_valid_api_key（全项目唯一口径），
+        避免各处重复实现导致判断漂移（历史 bug：分析链路用窄判断放行了
+        `.env` 的模板值 your_dashscope_api_key_here）。
+
+        有效条件：非空、长度 >= 5、且不是占位符（your_*、*_here、sk-xxx、
+        changeme、含 '...' 等一律视为无效）。
 
         Args:
             api_key: 待验证的 API Key
@@ -4103,33 +4104,9 @@ class ConfigService:
         Returns:
             bool: True 表示有效，False 表示无效
         """
-        if not api_key:
-            return False
+        from app.utils.api_key_utils import is_valid_api_key
 
-        # 去除首尾空格
-        api_key = api_key.strip()
-
-        # 检查是否为空
-        if not api_key:
-            return False
-
-        # 检查是否为占位符（前缀）
-        if api_key.startswith('your_') or api_key.startswith('your-'):
-            return False
-
-        # 检查是否为占位符（后缀）
-        if api_key.endswith('_here') or api_key.endswith('-here'):
-            return False
-
-        # 🔥 检查是否为截断的密钥（包含 '...'）
-        if '...' in api_key:
-            return False
-
-        # 检查长度（允许较短的测试 Key，但仍需排除明显无效值）
-        if len(api_key) < 5:
-            return False
-
-        return True
+        return is_valid_api_key(api_key)
 
     def _get_env_api_key(self, provider_name: str) -> Optional[str]:
         """从环境变量获取API密钥"""

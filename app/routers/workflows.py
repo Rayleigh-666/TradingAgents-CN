@@ -13,6 +13,7 @@ import logging
 from app.core.response import ok, fail
 from app.core.permissions import require_pro
 from app.routers.auth_db import get_current_user
+from app.utils.api_key_utils import is_valid_api_key
 from app.utils.compliance import (
     GENERIC_RESEARCH_RECOMMENDATION,
     build_research_summary,
@@ -896,10 +897,12 @@ async def _fill_api_keys_from_db(config: Dict[str, Any]) -> Dict[str, Any]:
         provider_doc = await db.llm_providers.find_one({"name": provider})
         if provider_doc:
             api_key = provider_doc.get("api_key", "")
-            if api_key and not api_key.startswith("sk-xxx"):
+            if is_valid_api_key(api_key):
                 config["quick_api_key"] = api_key
                 if not config.get("deep_api_key"):
                     config["deep_api_key"] = api_key
+            elif api_key:
+                logger.warning(f"[工作流执行] 厂家 {provider} 的 API Key 是占位符/无效值，已忽略")
 
     # 如果 deep 厂家不同，也需要获取其 API Key
     deep_provider = config.get("deep_llm_provider")
@@ -907,8 +910,10 @@ async def _fill_api_keys_from_db(config: Dict[str, Any]) -> Dict[str, Any]:
         provider_doc = await db.llm_providers.find_one({"name": deep_provider})
         if provider_doc:
             api_key = provider_doc.get("api_key", "")
-            if api_key and not api_key.startswith("sk-xxx"):
+            if is_valid_api_key(api_key):
                 config["deep_api_key"] = api_key
+            elif api_key:
+                logger.warning(f"[工作流执行] 厂家 {deep_provider} 的 API Key 是占位符/无效值，已忽略")
 
     return config
 
@@ -968,8 +973,8 @@ async def _get_llm_config_for_model(quick_model: Optional[str], deep_model: Opti
         if not backend_url:
             backend_url = provider_doc.get("default_base_url", "")
 
-    # 如果数据库没有 API Key，尝试从环境变量获取
-    if not api_key or api_key.startswith("sk-xxx"):
+    # 如果数据库没有有效 API Key，尝试从环境变量获取
+    if not is_valid_api_key(api_key):
         import os
         env_key_map = {
             "openai": "OPENAI_API_KEY",
@@ -981,7 +986,11 @@ async def _get_llm_config_for_model(quick_model: Optional[str], deep_model: Opti
         }
         env_name = env_key_map.get(provider_name.lower())
         if env_name:
-            api_key = os.getenv(env_name)
+            env_api_key = os.getenv(env_name)
+            if env_api_key and not is_valid_api_key(env_api_key):
+                logger.warning(f"[工作流执行] 环境变量 {env_name} 是占位符/无效值，已忽略")
+            else:
+                api_key = env_api_key
 
     result = {
         "llm_provider": provider_name,

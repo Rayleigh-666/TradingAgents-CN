@@ -17,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from app.utils.api_key_utils import truncate_api_key
+from app.utils.api_key_utils import is_placeholder_api_key, is_valid_api_key, truncate_api_key
+from app.utils.error_formatter import build_node_failure_message, summarize_error
 
 logger = logging.getLogger(__name__)
 
@@ -576,14 +577,22 @@ class LegacyDependencyProvider:
             # 🔥 确定 API Key（优先级：模型配置 > 厂家配置 > 环境变量）
             api_key = None
             model_api_key = default_config.get("api_key", "")
-            if model_api_key and model_api_key.strip() and model_api_key != "your-api-key" and not model_api_key.startswith("sk-xxx"):
+            if is_valid_api_key(model_api_key):
                 api_key = model_api_key
                 logger.info(f"✅ [依赖提供者] 使用模型配置的 API Key")
-            elif provider_doc:
+            elif model_api_key:
+                logger.warning(
+                    f"⚠️ [依赖提供者] 模型配置的 API Key 是占位符/无效值，已忽略并继续回退"
+                )
+            if not api_key and provider_doc:
                 provider_api_key = provider_doc.get("api_key", "")
-                if provider_api_key and provider_api_key.strip() and provider_api_key != "your-api-key" and not provider_api_key.startswith("sk-xxx"):
+                if is_valid_api_key(provider_api_key):
                     api_key = provider_api_key
                     logger.info(f"✅ [依赖提供者] 使用厂家配置的 API Key")
+                elif provider_api_key:
+                    logger.warning(
+                        f"⚠️ [依赖提供者] 厂家 {provider_name} 的 API Key 是占位符/无效值，已忽略"
+                    )
             
             backend_url = default_config.get("api_base", "")
             if provider_doc and not backend_url:
@@ -742,12 +751,16 @@ class LegacyDependencyProvider:
                         # 优先级1：厂家配置
                         if provider_doc and provider_doc.get("api_key"):
                             pk = provider_doc["api_key"]
-                            if pk and pk.strip() and pk != "your-api-key" and not pk.startswith("sk-xxx"):
+                            if is_valid_api_key(pk):
                                 api_key = pk
+                            else:
+                                logger.warning(
+                                    f"⚠️ [依赖提供者] 厂家 {provider} 的 API Key 是占位符/无效值，已忽略"
+                                )
 
                         # 优先级2：模型配置（作为备选）
                         if not api_key:
-                            if model_api_key and model_api_key.strip() and model_api_key != "your-api-key":
+                            if is_valid_api_key(model_api_key):
                                 api_key = model_api_key
 
                         # 优先级3：环境变量
@@ -827,8 +840,12 @@ class LegacyDependencyProvider:
             if provider_doc:
                 if provider_doc.get("default_base_url"):
                     result["backend_url"] = provider_doc["default_base_url"]
-                if provider_doc.get("api_key") and not provider_doc["api_key"].startswith("sk-xxx"):
+                if is_valid_api_key(provider_doc.get("api_key")):
                     result["api_key"] = provider_doc["api_key"]
+                elif provider_doc.get("api_key"):
+                    logger.warning(
+                        f"⚠️ [依赖提供者] 厂家 {provider_name} 的 API Key 是占位符/无效值，已忽略"
+                    )
 
             client.close()
 
@@ -2247,18 +2264,14 @@ class WorkflowBuilder:
 
             field_key = output_field or f"{agent_id}_report"
             degraded = {
-                field_key: (
-                    f"[{node_label} 执行失败]\n\n"
-                    f"该分析节点在运行过程中遇到错误，已跳过。\n"
-                    f"错误摘要: {type(exc).__name__}\n\n"
-                    f"其余节点的分析结果不受影响，请参考其他报告。"
-                ),
+                # 带上真实错误摘要（已脱敏/截断），避免用户只看到「ValueError」
+                field_key: build_node_failure_message(node_label, exc),
                 f"_node_errors": {
                     **(state.get("_node_errors", {}) if isinstance(state, dict) else {}),
                     node_id: {
                         "agent_id": agent_id,
                         "label": node_label,
-                        "error": str(exc)[:500],
+                        "error": summarize_error(exc, max_len=500),
                     },
                 },
             }
