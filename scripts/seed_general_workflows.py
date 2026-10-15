@@ -233,11 +233,9 @@ def build_daily_market_review() -> WorkflowDefinition:
         ),
         _market_type_field(2),
         _field("trade_date", "交易日", "date", group="基本参数", order=3),
-        _field("watch_sectors", "关注板块", "multiselect",
-               options=[], group="基本参数", order=4),
-        _field("watchlist", "自选股", "textarea", group="基本参数", order=5),
-        _research_depth_field(6),
-        *_model_fields(7),
+        _field("watchlist", "自选股", "textarea", group="基本参数", order=4),
+        _research_depth_field(5),
+        *_model_fields(6),
     ]
     return WorkflowDefinition(
         id="general_daily_market_review",
@@ -392,12 +390,10 @@ def build_capital_flow_monitor() -> WorkflowDefinition:
         _market_type_field(2),
         _field("lookback_days", "回溯天数", "number",
                default=20, group="基本参数", order=3),
-        _field("focus_sectors", "关注行业", "multiselect",
-               options=[], group="基本参数", order=4),
         _field("include_margin", "纳入两融", "boolean",
-               default=True, group="基本参数", order=5),
-        _research_depth_field(6),
-        *_model_fields(7),
+               default=True, group="基本参数", order=4),
+        _research_depth_field(5),
+        *_model_fields(6),
     ]
     return WorkflowDefinition(
         id="general_capital_flow_monitor",
