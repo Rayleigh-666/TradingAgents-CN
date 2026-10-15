@@ -16,6 +16,21 @@ from core.agents.registry import register_agent
 logger = logging.getLogger(__name__)
 
 
+# ==================== general 流程字段指令 ====================
+# 仅在 general 通用研究工作流的 input_config.fields 显式提供对应字段时，
+# 才向提示词追加指令；缺省时返回空串，保证单股/ETF 分析行为逐字不变。
+def _build_current_position_directive(value: Any) -> str:
+    """把 general 流程的「当前总仓位」渲染成提示词指令；无有效值返回空串。
+
+    ``0``（空仓）是合法业务取值，会渲染为指令；键缺失 / ``None`` / 空串返回空串。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str) and not value.strip():
+        return ""
+    return f"\n\n当前总仓位：{value}%，请在给出仓位建议时以此为基础。"
+
+
 # ==================== Schema 契约定义 ====================
 # 目的：让 LLM 从"自由决策输出格式"降级为"翻译一份预定义 schema"，
 # 从源头消除格式不一致（参考桥水 Pat 的"规格驱动"思路）。
@@ -301,6 +316,11 @@ class RiskManagerV2(ManagerAgent):
         logger.info(f"📊 股票代码: {ticker}")
         logger.info(f"📅 分析日期: {analysis_date}")
         logger.info(f"📝 输入字段: {list(inputs.keys())}")
+
+        # general 流程「当前总仓位」：仅在 state 显式提供时追加指令，缺省为空串（零影响）。
+        current_position_directive = _build_current_position_directive(
+            state.get("current_position_pct") if state else None
+        )
         
         # 检查各方风险观点
         risky_opinion = inputs.get("risky_opinion", "")
@@ -370,7 +390,7 @@ class RiskManagerV2(ManagerAgent):
         
         if prompt:
             logger.info(f"✅ 从模板系统获取风险评估师用户提示词 (长度: {len(prompt)})")
-            return prompt
+            return prompt + current_position_directive
         
         # 降级：使用默认用户提示词
         logger.info("⚠️ 使用降级用户提示词")
@@ -403,7 +423,7 @@ class RiskManagerV2(ManagerAgent):
 3. 给出后续观察事项与资料缺口。
 4. 明确不要直接给出具体操作建议、仓位安排、目标价、价格区间、止损止盈或执行节奏。
 
-输出目标是形成风险审阅结论，而不是具体操作建议。"""
+输出目标是形成风险审阅结论，而不是具体操作建议。""" + current_position_directive
 
     def _get_required_inputs(self) -> List[str]:
         """

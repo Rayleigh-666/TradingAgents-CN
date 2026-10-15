@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 # 从未赋值的 float 通道物化为类型零值 0.0，导致「未填写」在报告里被误显示为
 # 「0%」，与用户真的填了 0 无法区分。改用 Annotated[Any, keep_number]：
 # 缺省保持 None（消费方如实省略），显式 0 得以保留。
-_NUMBER_KEEP_ZERO_FIELDS = frozenset({"total_position_pct"})
+# current_position_pct（空仓=0）与 lookback_days=0 同样是合法业务取值，
+# 必须与「未提供」区分，故一并纳入本集合。
+_NUMBER_KEEP_ZERO_FIELDS = frozenset(
+    {"total_position_pct", "current_position_pct", "lookback_days"}
+)
 
 
 class StateSchemaBuilder:

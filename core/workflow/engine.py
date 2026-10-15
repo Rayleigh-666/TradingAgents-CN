@@ -375,6 +375,13 @@ class WorkflowEngine:
             "total_position_pct": FieldType.NUMBER,
             "risk_preference": FieldType.STRING,
             "benchmark": FieldType.STRING,
+            # 通用研究工作流（general）input_config.fields 的字段：include_margin /
+            # lookback_days 供 index_analyst_v2 消费（两融工具开关 / 统一回溯天数），
+            # current_position_pct 供 risk_manager_v2 消费（当前总仓位）。
+            # 若不声明，LangGraph 动态 State 会丢弃未声明键，各 agent 拿不到这些输入。
+            "include_margin": FieldType.BOOLEAN,
+            "lookback_days": FieldType.NUMBER,
+            "current_position_pct": FieldType.NUMBER,
             "position_type": FieldType.STRING,
             "analysis_params": FieldType.OBJECT,
             "stock_analysis_report": FieldType.OBJECT,

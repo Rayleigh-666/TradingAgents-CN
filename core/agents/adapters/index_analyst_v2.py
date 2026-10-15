@@ -21,6 +21,21 @@ logger = logging.getLogger(__name__)
 INDEX_REPORT_CACHE_TTL_HOURS = 1  # 大盘分析报告缓存有效期（小时）
 
 
+# ==================== general 流程字段指令 ====================
+# 仅在 general 通用研究工作流的 input_config.fields 显式提供对应字段时，
+# 才向提示词追加指令；缺省时返回空串，保证单股/ETF 分析行为逐字不变。
+def _build_lookback_days_directive(value: Any) -> str:
+    """把 general 流程的「回溯天数」渲染成提示词指令；无有效值返回空串。"""
+    if value is None:
+        return ""
+    if isinstance(value, str) and not value.strip():
+        return ""
+    return (
+        f"\n\n本次分析的统一回溯天数：{value} 个交易日，"
+        f"请在全部数据工具调用中采用该值。"
+    )
+
+
 def _get_cache_manager():
     """获取缓存管理器（延迟加载避免循环导入）"""
     try:
@@ -185,14 +200,21 @@ class IndexAnalystV2(AnalystAgent):
         "get_market_analysis",
     ]
 
-    def _get_tool_ids_for_mode(self, mode: str) -> list[str]:
+    def _get_tool_ids_for_mode(
+        self, mode: str, state: Optional[Dict[str, Any]] = None
+    ) -> list[str]:
+        # general「资金面监控」流程可用 include_margin=False 关闭两融工具。
+        # 必须用 `is False` 严格判定：state 缺键 / None / True 一律返回原工具集，
+        # 确保单股/ETF 分析（不传 state）行为与改动前逐字一致。
+        if state is not None and state.get("include_margin") is False:
+            return [tid for tid in self._TOOL_IDS if tid != "get_margin_trading"]
         return self._TOOL_IDS
 
     def _prepare_analysis_mode(self, state: Dict[str, Any]) -> str:
         mode = resolve_market_data_mode(state)
         state["_analysis_data_source"] = mode
         state["analysis_method"] = "qmt_market_structure" if mode == "qmt" else "tushare_market_full"
-        self._load_tools_v2(self._get_tool_ids_for_mode(mode))
+        self._load_tools_v2(self._get_tool_ids_for_mode(mode, state))
         return mode
 
     def _apply_mode_prompt_suffix(self, prompt: str, mode: str, prompt_type: str) -> str:
@@ -424,7 +446,10 @@ class IndexAnalystV2(AnalystAgent):
         
         if state is None:
             state = {}
-        
+
+        # general 流程「回溯天数」：仅在 state 显式提供时追加指令，缺省为空串（零影响）。
+        lookback_directive = _build_lookback_days_directive(state.get("lookback_days"))
+
         # 获取公司名称和市场信息
         company_name = self._get_company_name(ticker, state)
         market_type = state.get("market_type", "A股")
@@ -473,7 +498,7 @@ class IndexAnalystV2(AnalystAgent):
         if prompt:
             logger.info(f"✅ 从模板系统获取大盘分析师 v2.0 用户提示词 (长度: {len(prompt)})")
             logger.info(f"📝 用户提示词前500字符:\n{prompt[:500]}...")
-            return prompt
+            return prompt + lookback_directive
         
         # 降级：使用默认提示词（不再检查 tool_data，因为工具数据会通过 ToolMessage 传递）
         logger.warning("⚠️ 未从模板系统获取到用户提示词，使用默认提示词")
@@ -497,7 +522,7 @@ class IndexAnalystV2(AnalystAgent):
     3. 主要支撑因素、主要风险与资料缺口
     4. 后续观察事项
 
-    禁止输出热点追逐表述、对冲安排、仓位配置、买卖建议、目标价、价格区间或任何执行性指令。"""
+    禁止输出热点追逐表述、对冲安排、仓位配置、买卖建议、目标价、价格区间或任何执行性指令。""" + lookback_directive
 
         return f"""## 分析任务
 
@@ -516,7 +541,7 @@ class IndexAnalystV2(AnalystAgent):
     3. 主要支撑因素、主要风险与资料缺口
     4. 后续观察事项
 
-    禁止输出热点追逐表述、对冲安排、仓位配置、买卖建议、目标价、价格区间或任何执行性指令。"""
+    禁止输出热点追逐表述、对冲安排、仓位配置、买卖建议、目标价、价格区间或任何执行性指令。""" + lookback_directive
 
     def _get_tool_suggestions(self, market_type: str) -> str:
         """根据市场类型生成工具调用建议"""
