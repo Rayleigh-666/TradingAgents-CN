@@ -108,6 +108,7 @@ def _field(
     order: int = 0,
     min: float | None = None,
     max: float | None = None,
+    maxlength: int | None = None,
 ) -> InputFieldConfig:
     return InputFieldConfig(
         name=name,
@@ -121,6 +122,7 @@ def _field(
         option_labels=option_labels,
         min=min,
         max=max,
+        maxlength=maxlength,
         group=group,
         order=order,
     )
@@ -446,6 +448,7 @@ def build_portfolio_health_check() -> WorkflowDefinition:
             required=True,
             description="每行一只：代码,权重%（或市值）,成本价",
             placeholder="600519,30,1500",
+            maxlength=4000,
             group="基本参数", order=3,
         ),
         _field("total_position_pct", "当前总仓位(%)", "number",

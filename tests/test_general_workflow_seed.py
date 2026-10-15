@@ -146,6 +146,32 @@ def test_input_config_has_required_analysis_target(workflows):
             assert f.type in allowed, f"{wf.id} 字段 {f.name} 非法 type={f.type}"
 
 
+def test_input_maxlength_is_field_config_driven(workflows):
+    """textarea 的 maxlength 由字段配置驱动。
+
+    holdings（持仓数据，每行一只标的）需放宽到 4000，避免较大组合被截断；
+    其余字段一律不配置（``None``）——前端 GeneralAnalysis.vue 以
+    ``field.maxlength ?? 500`` 渲染，只有保持 None 才能维持默认 500 的零行为变化。
+    """
+    by_wf = {wf.id: {f.name: f for f in wf.input_config.fields} for wf in workflows}
+
+    holdings = by_wf["general_portfolio_health_check"]["holdings"]
+    assert holdings.type == "textarea"
+    assert holdings.maxlength == 4000
+
+    # 除 holdings 外，所有字段都不应显式配置 maxlength
+    for wf in workflows:
+        for f in wf.input_config.fields:
+            if wf.id == "general_portfolio_health_check" and f.name == "holdings":
+                continue
+            assert f.maxlength is None, (
+                f"{wf.id} 字段 {f.name} 不应设置 maxlength，当前={f.maxlength}"
+            )
+
+    # 显式抽查流程 1 的 analysis_target 未配置
+    assert by_wf["general_daily_market_review"]["analysis_target"].maxlength is None
+
+
 def test_validator_passes(workflows):
     validator = WorkflowValidator()
     for wf in workflows:

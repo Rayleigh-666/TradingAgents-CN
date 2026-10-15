@@ -120,7 +120,7 @@
                         type="textarea"
                         :rows="4"
                         :placeholder="field.placeholder || ''"
-                        maxlength="500"
+                        :maxlength="field.maxlength ?? 500"
                         show-word-limit
                       />
 

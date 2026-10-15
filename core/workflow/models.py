@@ -131,6 +131,7 @@ class InputFieldConfig(BaseModel):
     option_labels: Optional[List[str]] = None  # 选项显示名（与 options 一一对应）
     min: Optional[float] = None              # 数值最小值
     max: Optional[float] = None              # 数值最大值
+    maxlength: Optional[int] = None          # 输入框最大字符数（textarea 使用；None 表示沿用前端默认）
     group: str = ""                          # 分组标签（如"基本参数"/"高级参数"）
     order: int = 0                           # 排序
 

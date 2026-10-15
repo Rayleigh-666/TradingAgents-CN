@@ -69,6 +69,7 @@ export interface InputFieldConfig {
   option_labels?: string[]      // 选项显示名（与 options 一一对应）
   min?: number
   max?: number
+  maxlength?: number            // 输入框最大字符数（textarea 使用；缺省时前端按 500 处理）
   group?: string                // 分组标签
   order?: number
 }
