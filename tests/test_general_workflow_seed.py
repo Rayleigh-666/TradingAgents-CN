@@ -129,6 +129,34 @@ def test_merge_nodes_use_wait_all(workflows):
                 )
 
 
+def test_capital_flow_monitor_drops_single_stock_market_node(workflows):
+    """流程 3（北向 · 两融增量资金面监控）不得包含单股量价技术面节点。
+
+    ``market_analyst_v2`` 是单股量价技术面模板（只绑 ``get_stock_market_data_unified``，
+    prompt 全文无「北向/两融/杠杆」）。该流程的分析目标是自由文本
+    （如「当前A股增量资金面（北向+两融）监控」），工具会把它当股票代码去查、
+    失败后回落美股数据源，最终产出 3117 字符的「数据缺失说明书」，纯噪音。
+    因此流程 3 只保留 ``a_index``（北向/两融/市场宽度）与 ``a_sector``（板块资金流）
+    两条腿。
+    """
+    wf = next(w for w in workflows if w.id == "general_capital_flow_monitor")
+
+    node_ids = {n.id for n in wf.nodes}
+    assert "a_market" not in node_ids, "流程 3 不应再包含 a_market 节点"
+    assert all(n.agent_id != "market_analyst_v2" for n in wf.nodes), (
+        "流程 3 不应再引用 market_analyst_v2（单股量价技术面模板）"
+    )
+
+    # 结构计数（去掉 a_market 后的实际值：8 节点 / 8 边）
+    assert len(wf.nodes) == 8, f"流程 3 节点数应为 8，实际 {len(wf.nodes)}"
+    assert len(wf.edges) == 8, f"流程 3 边数应为 8，实际 {len(wf.edges)}"
+
+    # 边必须成对消失且无孤边
+    for edge in wf.edges:
+        assert edge.source in node_ids, f"流程 3 边源不存在: {edge.source}"
+        assert edge.target in node_ids, f"流程 3 边目标不存在: {edge.target}"
+
+
 def test_input_config_has_required_analysis_target(workflows):
     for wf in workflows:
         fields = wf.input_config.fields
