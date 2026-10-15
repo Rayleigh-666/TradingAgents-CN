@@ -13,7 +13,9 @@
 - 有效前沿失败三路径（标的 <2 / 工具抛错 / 返回非 JSON）各自「不可用 + 原因」且不编造数值；
 - ``compute_concentration`` 的 HHI / topN 数值正确性（等权兜底也覆盖）；
 - ``execute`` 在 holdings 缺失/为空时返回明确「未提供持仓」提示，且**不含任何数值**；
-- ``_count_trading_days`` 的导入源防线（``core.skill_runtime.data_access``）。
+- ``_count_trading_days`` 的导入源防线（``core.skill_runtime.data_access``）与 3 元组契约；
+- R3 数据窗口：头部回显**库内真实最后一根 K 线日期**（不是 ``datetime.now()``），
+  无可用日线时如实写「不可用」，明显落后时给「可能未同步」告警。
 
 跑法（必须在清空环境后执行，否则 import tradingagents 会触发 config.mkdir 的
 PermissionError）::
@@ -173,8 +175,12 @@ def test_execute_empty_holdings_no_fabricated_numbers():
 # --------------------------------------------------------------------------- #
 # 6. 市场支持范围：非 cn **逐只跳过**，不再整包降级（P1-2）
 # --------------------------------------------------------------------------- #
-def _patch_offline(monkeypatch, frontier=None):
-    monkeypatch.setattr(pa, "_count_trading_days", lambda codes, lb: ({}, None))
+def _patch_offline(monkeypatch, frontier=None, last_dates=None):
+    monkeypatch.setattr(
+        pa,
+        "_count_trading_days",
+        lambda codes, lb: ({}, dict(last_dates or {}), None),
+    )
 
     def _fake_ef(positions, lookback_days):
         if frontier is None:
@@ -436,7 +442,7 @@ def test_non_cn_symbol_not_queried_for_a_share_daily(monkeypatch):
 
     def _spy(codes, lookback):
         queried.extend(codes)
-        return ({c: 240 for c in codes}, None)
+        return ({c: 240 for c in codes}, {c: "2026-10-15" for c in codes}, None)
 
     monkeypatch.setattr(pa, "_count_trading_days", _spy)
     monkeypatch.setattr(
@@ -503,7 +509,7 @@ def test_ef_path_non_json(monkeypatch):
 def test_ef_failure_report_has_no_fabricated_numbers(monkeypatch):
     import core.tools.implementations.portfolio.quant_tools as quant_tools
 
-    monkeypatch.setattr(pa, "_count_trading_days", lambda codes, lb: ({}, None))
+    monkeypatch.setattr(pa, "_count_trading_days", lambda codes, lb: ({}, {}, None))
     monkeypatch.setattr(
         quant_tools, "get_efficient_frontier", _ToolStub(raises=RuntimeError("行情库不可用"))
     )
@@ -537,15 +543,99 @@ def test_extra_numeric_token_warns_not_silent():
 
 
 # --------------------------------------------------------------------------- #
-# 18. P2-7：报告头部明示「数据窗口」
+# 18. P2-7 / R3：报告头部的「数据窗口」取**库内真实最后一根 K 线日期**
 # --------------------------------------------------------------------------- #
-def test_report_header_shows_data_window(monkeypatch):
-    _patch_offline(monkeypatch, frontier=_fake_success_frontier())
+def test_report_header_shows_real_last_bar_date(monkeypatch):
+    """头部回显的是本地库内真实的最后一根 K 线日期（取各标的中最新的一根）。"""
+    _patch_offline(
+        monkeypatch,
+        frontier=_fake_success_frontier(),
+        last_dates={"600519": "2026-10-14", "000858": "2026-10-15"},
+    )
     positions = [_pos("600519", 50.0), _pos("000858", 50.0)]
     facts = pa.compute_portfolio_facts(positions, market_type="cn")
+    assert facts["data_window_end"] == "2026-10-15"
     report = pa.render_portfolio_report(facts, analysis_date="2026-01-01")
-    assert "数据窗口：截至" in report
+    assert "数据窗口：截至 2026-10-15（本地库最后一根）" in report
     assert "分析日期：2026-01-01" in report
+
+
+def test_report_header_marks_data_window_unavailable_when_no_daily(monkeypatch):
+    """库内一根日线都没有时，如实写「不可用」，**不得**硬填今天或任何日期。"""
+    _patch_offline(monkeypatch, frontier=_fake_success_frontier(), last_dates={})
+    positions = [_pos("600519", 50.0), _pos("000858", 50.0)]
+    facts = pa.compute_portfolio_facts(positions, market_type="cn")
+    assert facts["data_window_end"] == ""
+    report = pa.render_portfolio_report(facts)
+    assert "数据窗口：不可用（本地库无可用日线）" in report
+    assert "数据窗口：截至" not in report
+
+
+def test_facts_without_data_window_key_render_as_unavailable():
+    """facts 缺 data_window_end 键（手工构造的旧 facts）也不得渲染出一个假日期。"""
+    report = pa.render_portfolio_report({"positions": [], "market_type": "cn"})
+    assert "数据窗口：不可用（本地库无可用日线）" in report
+    assert "数据窗口：截至" not in report
+
+
+def test_stale_local_daily_emits_sync_warning(monkeypatch):
+    """本地日线明显落后（>20 天）时给出「可能未同步」告警。"""
+    _patch_offline(
+        monkeypatch,
+        frontier=_fake_success_frontier(),
+        last_dates={"600519": "2020-01-02", "000858": "2020-01-03"},
+    )
+    positions = [_pos("600519", 50.0), _pos("000858", 50.0)]
+    facts = pa.compute_portfolio_facts(positions, market_type="cn")
+    assert facts["data_window_end"] == "2020-01-03"
+    assert any("未同步至最新交易日" in w for w in facts["warnings"])
+
+
+def test_recent_local_daily_emits_no_sync_warning(monkeypatch):
+    """近期数据（阈值内）不产生噪音告警。"""
+    from datetime import datetime, timedelta
+
+    recent = (datetime.now().date() - timedelta(days=3)).strftime("%Y-%m-%d")
+    _patch_offline(
+        monkeypatch,
+        frontier=_fake_success_frontier(),
+        last_dates={"600519": recent, "000858": recent},
+    )
+    positions = [_pos("600519", 50.0), _pos("000858", 50.0)]
+    facts = pa.compute_portfolio_facts(positions, market_type="cn")
+    assert not any("未同步至最新交易日" in w for w in facts["warnings"])
+
+
+def test_normalize_trade_date_handles_both_storage_formats():
+    """库内两种 trade_date 存储形态都要归一成 YYYY-MM-DD；无法识别返回空串。"""
+    assert pa._normalize_trade_date("20261015") == "2026-10-15"
+    assert pa._normalize_trade_date("2026-10-15") == "2026-10-15"
+    assert pa._normalize_trade_date("2026/10/15") == "2026-10-15"  # 非标准分隔符也能救回
+    for bad in ("", None, "2026-1", "abc", "20261", 2026101):
+        assert pa._normalize_trade_date(bad) == "", f"{bad!r} 应判为不可用"
+
+
+def test_count_trading_days_returns_last_bar_dates(monkeypatch):
+    """``_count_trading_days`` 必须同时给出根数与最后一根日期（3 元组契约）。"""
+
+    class _StubQuotes:
+        @staticmethod
+        def _rows(symbol, start, end, limit=None):
+            # 故意乱序返回，验证取的是 max() 而不是末行
+            return [
+                {"trade_date": "2026-10-13"},
+                {"trade_date": "20261015"},
+                {"trade_date": "2026-10-14"},
+            ]
+
+    monkeypatch.setattr(
+        "core.skill_runtime.data_access.get_stock_daily_quotes",
+        _StubQuotes._rows,
+    )
+    counts, last_dates, err = pa._count_trading_days(["600519"], 60)
+    assert err is None
+    assert counts == {"600519": 3}
+    assert last_dates == {"600519": "2026-10-15"}
 
 
 # --------------------------------------------------------------------------- #

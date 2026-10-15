@@ -390,15 +390,30 @@ def compute_concentration(
     }
 
 
-def _count_trading_days(codes: List[str], lookback_days: int) -> Tuple[Dict[str, Any], Optional[str]]:
+def _normalize_trade_date(value: Any) -> str:
+    """把库内 ``trade_date`` 的两种存储形态（``YYYYMMDD`` / ``YYYY-MM-DD``）统一成 ``YYYY-MM-DD``。
+
+    库内两种形态并存（见 ``data_access.get_stock_daily_quotes`` 的日期过滤器同时匹配
+    两种写法）。无法识别时返回空串——宁可判为「不可用」，也不要猜一个日期出来。
     """
-    从本地行情库读取每只标的的日线根数（数据可用性证据）。
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) != 8:
+        return ""
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+
+def _count_trading_days(
+    codes: List[str], lookback_days: int
+) -> Tuple[Dict[str, Any], Dict[str, str], Optional[str]]:
+    """
+    从本地行情库读取每只标的的日线根数（数据可用性证据）与**最后一根 K 线日期**。
 
     Returns:
-        ``(symbol_counts, error_message)``；error_message 为 None 表示正常。
+        ``(symbol_counts, symbol_last_dates, error_message)``；
+        error_message 为 None 表示正常；``symbol_last_dates`` 只包含真正读到数据的标的。
     """
     if not codes:
-        return {}, None
+        return {}, {}, None
     try:
         # 用 data_access 版本（与 get_efficient_frontier 内部一致）：
         # 它同时兼容库内 YYYYMMDD 与 YYYY-MM-DD 两种 trade_date 存储，而
@@ -408,22 +423,29 @@ def _count_trading_days(codes: List[str], lookback_days: int) -> Tuple[Dict[str,
         # 若沿用它会得到一个「真实但被截断」的错误根数，与工具报告的重叠交易日自相矛盾。
         from core.skill_runtime.data_access import get_stock_daily_quotes
     except Exception as exc:  # pragma: no cover - 导入失败属环境异常
-        return {}, f"本地行情库工具不可用：{exc}"
+        return {}, {}, f"本地行情库工具不可用：{exc}"
 
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=int(lookback_days) * 2 + 50)).strftime("%Y-%m-%d")
 
     counts: Dict[str, Any] = {}
+    last_dates: Dict[str, str] = {}
     for code in codes:
         try:
             rows = get_stock_daily_quotes(
                 code, start, end, limit=int(lookback_days) + 100
             ) or []
             counts[code] = len(rows)
+            # 用 max() 而不是取末行：不依赖函数是否真的按 trade_date 升序返回，
+            # 归一化成 YYYY-MM-DD 后字典序最大即最新交易日。
+            dates = [_normalize_trade_date((r or {}).get("trade_date")) for r in rows]
+            dates = [d for d in dates if d]
+            if dates:
+                last_dates[code] = max(dates)
         except Exception as exc:  # 单只失败不影响其他
             counts[code] = None
             logger.warning("读取 %s 日线失败：%s", code, exc)
-    return counts, None
+    return counts, last_dates, None
 
 
 def _warning_mentions_code(text: str, code: str) -> bool:
@@ -604,9 +626,33 @@ def compute_portfolio_facts(
         code = p.get("code")
         if code and code not in cn_codes:
             cn_codes.append(code)
-    symbol_days, quotes_error = _count_trading_days(cn_codes, lookback_days)
+    symbol_days, symbol_last_dates, quotes_error = _count_trading_days(
+        cn_codes, lookback_days
+    )
     if quotes_error:
         warnings.append(f"读取本地行情库失败：{quotes_error}")
+
+    # 数据窗口：取本地库内**真实存在**的最后一根 K 线日期，而不是 datetime.now()。
+    # 用 now() 会出现「标注截至今天、实际数据只到上周」的误导（本地日线未同步时）。
+    # 无任何可用日线时留空，由渲染层显式标注「不可用」而不是硬填一个日期。
+    data_window_end = max(symbol_last_dates.values()) if symbol_last_dates else ""
+    facts["data_window_end"] = data_window_end
+    facts["symbol_last_dates"] = symbol_last_dates
+
+    # 本地库日线明显落后于今天时显式提示。阈值取 20 个自然日，避开周末与长假误报。
+    if data_window_end:
+        try:
+            _stale_days = (
+                datetime.now().date()
+                - datetime.strptime(data_window_end, "%Y-%m-%d").date()
+            ).days
+            if _stale_days > 20:
+                warnings.append(
+                    f"本地库日线最新一根为 {data_window_end}，距今日已 {_stale_days} 天，"
+                    "数据可能未同步至最新交易日。"
+                )
+        except (TypeError, ValueError):  # pragma: no cover - 日期形态已在上游归一化
+            pass
 
     # 有效前沿：始终用剩余的 cn 标的计算（不足 2 只或工具失败/解析失败时不可用）
     overlapping = None
@@ -660,14 +706,18 @@ def render_portfolio_report(
 
     lines.append("# 持仓组合健康度体检")
     lines.append("")
-    # 数据窗口：行情数据永远取「截至今天」，与用户的 analysis_date（可能为历史日期）
-    # 未必一致。显式回显数据窗口，避免「标注 2026-01-01、数据却截至今天」的误导。
-    data_window_end = datetime.now().strftime("%Y-%m-%d")
+    # 数据窗口：回显本地库内**真实**的最后一根 K 线日期，而不是 datetime.now()。
+    # 用 now() 会出现「标注截至今天、实际数据只到上周」的误导（本地日线未同步时）；
+    # 取不到任何可用日线时如实写「不可用」，绝不硬填一个日期。
+    data_window_end = str(facts.get("data_window_end") or "").strip()
     meta_bits = []
     if analysis_date:
         meta_bits.append(f"分析日期：{analysis_date}")
     meta_bits.append(f"市场：{facts.get('market_type', 'cn')}")
-    meta_bits.append(f"数据窗口：截至 {data_window_end}")
+    if data_window_end:
+        meta_bits.append(f"数据窗口：截至 {data_window_end}（本地库最后一根）")
+    else:
+        meta_bits.append("数据窗口：不可用（本地库无可用日线）")
     if total_position_pct not in (None, ""):
         meta_bits.append(f"当前总仓位：{total_position_pct}%")
     if risk_preference:
