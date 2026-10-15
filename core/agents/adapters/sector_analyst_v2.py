@@ -362,6 +362,8 @@ class SectorAnalystV2(AnalystAgent):
         )
         mode = state.get("_analysis_data_source", "tushare")
         prompt = self._apply_mode_prompt_suffix(prompt, mode, "system")
+        # 归一为字符串：模板返回 None 时避免 len(None) 抛 TypeError，且不改变非空字符串
+        prompt = prompt or ""
         
         logger.info(f"📝 系统提示词长度: {len(prompt)} 字符")
 
@@ -371,6 +373,7 @@ class SectorAnalystV2(AnalystAgent):
         # 降级：使用默认提示词（包含工具信息）
         mode = state.get("_analysis_data_source", "tushare")
         if mode == "qmt":
+            # 注：qmt 降级分支当前被 `_apply_mode_prompt_suffix` 的提前返回遮蔽、实际不可达，保留以防后缀逻辑变更。
             return f"""您是一位专业的{market_type}板块/行业分析师。
 
 ## 您的职责
@@ -378,7 +381,7 @@ class SectorAnalystV2(AnalystAgent):
 
 ## 可用工具
 您可以调用以下工具获取真实板块数据：
-{tool_descriptions}
+{self._get_tool_descriptions()}
 
 ## ⚠️ 重要规则
 1. 必须调用工具，不要臆造同花顺板块资金流或官方概念板块排名。
@@ -388,6 +391,7 @@ class SectorAnalystV2(AnalystAgent):
 ## 输出格式
 请使用中文输出结构化报告，并明确代理指标与官方统计口径的区别。"""
 
+        # 降级分支（模板获取失败/为空时可达）：使用默认提示词并渲染工具说明。
         return f"""您是一位专业的{market_type}板块/行业分析师。
 
 ## 您的职责
@@ -395,7 +399,7 @@ class SectorAnalystV2(AnalystAgent):
 
 ## 可用工具
 您可以调用以下工具获取行业和板块数据：
-{tool_descriptions}
+{self._get_tool_descriptions()}
 
 ## ⚠️ 重要规则
 1. **必须调用工具**：在分析之前，必须先调用相关工具获取真实数据
