@@ -130,9 +130,14 @@ def _field(
 
 _RESEARCH_DEPTH_OPTIONS = ["快速", "基础", "标准", "深度", "全面"]
 
-# 目标市场：用于数据源/工具的市场路由（cn/hk/us），与分析目标自由文本相互独立
-_MARKET_TYPE_OPTIONS = ["cn", "hk", "us"]
-_MARKET_TYPE_LABELS = ["中国A股", "中国香港", "美股"]
+# 目标市场：当前**仅支持中国A股**。
+# 依据：4 条 general 流程的分析师全部绑定 A 股专有的**市场级**工具
+# （get_china_market_overview / get_market_breadth / get_north_flow /
+#   get_margin_trading / get_limit_stats 等），全仓库不存在港股/美股的**市场级**
+# 数据工具；且 market_type 并不参与数据源路由（路由走 analysis_data_source 等，
+# 见 core/agents/utils/data_source_mode.py）。因此提供 hk/us 只是假象，收成单选项。
+_MARKET_TYPE_OPTIONS = ["cn"]
+_MARKET_TYPE_LABELS = ["中国A股"]
 
 
 def _market_type_field(order: int) -> InputFieldConfig:
@@ -141,8 +146,8 @@ def _market_type_field(order: int) -> InputFieldConfig:
         "目标市场",
         "select",
         default="cn",
-        description="用于数据源市场路由（不影响上面的分析目标文本）",
-        placeholder="选择目标市场",
+        description="目标市场（当前仅支持中国A股：港股/美股的市场级数据源尚未接入）",
+        placeholder="中国A股",
         options=list(_MARKET_TYPE_OPTIONS),
         option_labels=list(_MARKET_TYPE_LABELS),
         group="基本参数",
@@ -235,9 +240,8 @@ def build_daily_market_review() -> WorkflowDefinition:
         ),
         _market_type_field(2),
         _field("trade_date", "交易日", "date", group="基本参数", order=3),
-        _field("watchlist", "自选股", "textarea", group="基本参数", order=4),
-        _research_depth_field(5),
-        *_model_fields(6),
+        _research_depth_field(4),
+        *_model_fields(5),
     ]
     return WorkflowDefinition(
         id="general_daily_market_review",
@@ -319,16 +323,10 @@ def build_market_emotion_cycle() -> WorkflowDefinition:
             group="基本参数", order=1,
         ),
         _market_type_field(2),
-        _field("window_days", "观察窗口(日)", "number",
-               default=20, group="基本参数", order=3),
         _field("current_position_pct", "当前仓位(%)", "number",
-               group="基本参数", order=4),
-        _field("breadth_scope", "市场宽度口径", "select",
-               default="全市场（含ST/次新）",
-               options=["全市场（含ST/次新）", "剔除ST/次新"],
-               group="基本参数", order=5),
-        _research_depth_field(6),
-        *_model_fields(7),
+               group="基本参数", order=3),
+        _research_depth_field(4),
+        *_model_fields(5),
     ]
     return WorkflowDefinition(
         id="general_market_emotion_cycle",
@@ -434,7 +432,7 @@ def build_portfolio_health_check() -> WorkflowDefinition:
     fields = [
         _field(
             "analysis_target", "分析目标", "textarea",
-            required=True, default="以下持仓组合的健康度体检",
+            required=False, default="以下持仓组合的健康度体检",
             description="本次组合体检的分析目标",
             placeholder="如：以下持仓组合的健康度体检",
             group="基本参数", order=1,

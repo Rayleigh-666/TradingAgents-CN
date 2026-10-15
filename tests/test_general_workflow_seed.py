@@ -157,12 +157,12 @@ def test_capital_flow_monitor_drops_single_stock_market_node(workflows):
         assert edge.target in node_ids, f"流程 3 边目标不存在: {edge.target}"
 
 
-def test_input_config_has_required_analysis_target(workflows):
+def test_input_config_analysis_target_shape(workflows):
+    """每条流程都保留 analysis_target（textarea），并做字段 type 的通用校验。"""
     for wf in workflows:
         fields = wf.input_config.fields
         by_name = {f.name: f for f in fields}
         assert "analysis_target" in by_name, f"{wf.id} 缺少 analysis_target"
-        assert by_name["analysis_target"].required is True, f"{wf.id} analysis_target 应为必填"
         assert by_name["analysis_target"].type == "textarea"
         # 模型字段命名必须精确
         for f in fields:
@@ -172,6 +172,65 @@ def test_input_config_has_required_analysis_target(workflows):
         allowed = {"string", "textarea", "number", "boolean", "date", "select", "multiselect"}
         for f in fields:
             assert f.type in allowed, f"{wf.id} 字段 {f.name} 非法 type={f.type}"
+
+
+def test_analysis_target_requiredness_by_workflow(workflows):
+    """analysis_target 必填性按流程区分：流程 1/2/3 必填，流程 4 非必填。
+
+    流程 4（持仓组合体检）的 ``portfolio_analyst_v2`` 只读 ``holdings``，从不读
+    ``ticker``；必填拦截只发生在前端 ``frontend/src/views/Analysis/GeneralAnalysis.vue``
+    的 ``field.required`` 上，后端无校验。故流程 4 的 analysis_target 只是一个
+    「分析目标」展示位，收紧为非必填，消除无消费方的必填假象。
+    """
+    by_wf = {wf.id: {f.name: f for f in wf.input_config.fields} for wf in workflows}
+
+    for wf_id in (
+        "general_daily_market_review",
+        "general_market_emotion_cycle",
+        "general_capital_flow_monitor",
+    ):
+        assert by_wf[wf_id]["analysis_target"].required is True, (
+            f"{wf_id} analysis_target 应仍为必填"
+        )
+
+    assert by_wf["general_portfolio_health_check"]["analysis_target"].required is False, (
+        "流程 4 analysis_target 应为非必填（无消费方，portfolio_analyst_v2 只读 holdings）"
+    )
+
+
+def test_dead_fields_removed(workflows):
+    """3 个无消费方字段已删除：流程1 watchlist、流程2 window_days/breadth_scope。
+
+    - ``watchlist``（流程1 自选股）：无任何 agent 读取，纯展示噪音。
+    - ``window_days`` / ``breadth_scope``（流程2）：无消费方。
+    - ``current_position_pct`` **保留**（另一批会把它接通为动态 State 字段）。
+    """
+    names = {wf.id: {f.name for f in wf.input_config.fields} for wf in workflows}
+
+    assert "watchlist" not in names["general_daily_market_review"]
+    assert "window_days" not in names["general_market_emotion_cycle"]
+    assert "breadth_scope" not in names["general_market_emotion_cycle"]
+    assert "current_position_pct" in names["general_market_emotion_cycle"]
+
+
+def test_market_type_locked_to_cn(workflows):
+    """4 条流程的 market_type 只提供 cn（不存在 hk/us 的市场级数据源）。"""
+    for wf in workflows:
+        f = next(x for x in wf.input_config.fields if x.name == "market_type")
+        assert f.type == "select", f"{wf.id} market_type 应为 select"
+        assert f.options == ["cn"], f"{wf.id} market_type options={f.options}"
+        assert f.option_labels == ["中国A股"], f"{wf.id} option_labels={f.option_labels}"
+        assert f.default == "cn", f"{wf.id} market_type default={f.default}"
+
+
+def test_field_order_is_gapless_from_one(workflows):
+    """每条流程的字段 order 必须从 1 起连续无空洞（删除字段后必须重排）。"""
+    for wf in workflows:
+        orders = [f.order for f in wf.input_config.fields]
+        assert orders, f"{wf.id} 无字段"
+        assert orders == list(range(1, len(orders) + 1)), (
+            f"{wf.id} order 非 1..N 连续序列，实际={orders}"
+        )
 
 
 def test_input_maxlength_is_field_config_driven(workflows):

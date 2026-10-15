@@ -80,6 +80,46 @@ def apply_general_ticker_fallback(workflow_inputs: Dict[str, Any]) -> Optional[s
     return value
 
 
+def apply_general_trade_date_fallback(workflow_inputs: Dict[str, Any]) -> Optional[str]:
+    """通用研究工作流：让用户显式提供的 trade_date 优先于「今天」。
+
+    仅对 ``task_category == "general"`` 生效。
+
+    背景：``_execute_via_workflow`` 原本**无条件**把 ``analysis_date`` 补成
+    ``datetime.now()``，而 ``core/workflow/engine.py`` 的映射优先级是
+    ``analysis_date or trade_date``，于是流程 1 的「交易日」字段被恒覆盖，
+    用户选的日期永远不生效。本函数在兜底成「今天」之前，把用户显式提供的
+    ``trade_date`` 写入 ``analysis_date``。
+
+    门控/写入门槛：
+    - 非 general 任务：不做任何写入，返回 ``None``；
+    - ``analysis_date`` 已有值：不覆盖，返回 ``None``；
+    - ``trade_date`` 缺省或为空白串：不写入，返回 ``None``；
+    - 只写 ``analysis_date``，**绝不回写 ``trade_date``**。
+
+    Args:
+        workflow_inputs: 工作流输入参数字典（原地修改 analysis_date）
+
+    Returns:
+        实际写入 analysis_date 的值；未做任何写入时返回 None。
+    """
+    # 门控：仅通用研究任务（大小写/空白不敏感，与 apply_general_ticker_fallback 一致）
+    if str(workflow_inputs.get("task_category") or "").strip().lower() != "general":
+        return None
+
+    # 已有 analysis_date 时不覆盖（用户/上游显式给定优先）
+    if workflow_inputs.get("analysis_date"):
+        return None
+
+    trade_date = workflow_inputs.get("trade_date")
+    value = str(trade_date).strip() if trade_date is not None else ""
+    if not value:
+        return None
+
+    workflow_inputs["analysis_date"] = value
+    return value
+
+
 class UnifiedAnalysisEngine:
     """统一分析引擎
     
@@ -718,6 +758,16 @@ class UnifiedAnalysisEngine:
                 f"（仅引擎入参，不写 symbol/stock_code）"
             )
 
+        # 🆕 [general] 流程 1「交易日」：让用户显式提供的 trade_date 优先于「今天」。
+        # 真因：下面 `if not analysis_date` 会**无条件**兜底成 datetime.now()，而引擎
+        # 的映射优先级是 `analysis_date or trade_date`，用户选的交易日因此被恒覆盖。
+        # 兜底见 apply_general_trade_date_fallback（**只写 analysis_date**，不回写 trade_date）。
+        _filled_trade_date = apply_general_trade_date_fallback(workflow_inputs)
+        if _filled_trade_date:
+            self.logger.info(
+                f"📋 [general] 交易日 trade_date → analysis_date 入参 = {_filled_trade_date!r}"
+            )
+
         # 通用兜底参数（当 input_config 不存在或未定义对应字段时）
         from datetime import datetime
         # 🔑 注意：不能用 setdefault，因为 API 请求可能传入 analysis_date=None，
@@ -729,8 +779,13 @@ class UnifiedAnalysisEngine:
         # 因为 0 可能是合法值（如 lookback_days=0），不能被误替换成默认值。
         if not workflow_inputs.get("research_depth"):
             workflow_inputs["research_depth"] = "标准"
+        # ⚠️ lookback_days 默认值**仅对 general 补齐**：该字段只存在于流程 3，若像原
+        # 来那样无条件写入，单股/ETF 等没有该字段的分析类型也会被塞入默认值；一旦
+        # lookback_days 被提升为动态 State 字段，就会泄漏并污染单股分析的取证窗口。
+        # 保留「显式判空」的外层写法（不要改用 setdefault）。
         if workflow_inputs.get("lookback_days") is None:
-            workflow_inputs["lookback_days"] = 30
+            if str(workflow_inputs.get("task_category") or "").strip().lower() == "general":
+                workflow_inputs["lookback_days"] = 30
         if workflow_inputs.get("max_debate_rounds") is None:
             workflow_inputs["max_debate_rounds"] = 3
 

@@ -25,6 +25,13 @@
    传 ``symbol="自由文本"`` 会绕过守卫、非 general 流程传 ``task_category="general"``
    会命中 registry 的 symbol 豁免判据。⇒ 入口侧新增 ``_sanitize_custom_params``，
    丢弃 None 值与四个保留键。
+
+4. 「交易日」字段形同虚设
+   ``_execute_via_workflow`` 原**无条件**把 ``analysis_date`` 补成 ``datetime.now()``，
+   而 ``core/workflow/engine.py`` 的映射优先级是 ``analysis_date or trade_date``，
+   于是流程 1 用户选的 ``trade_date`` 永远被覆盖。⇒ ``apply_general_trade_date_fallback``
+   在兜底成「今天」之前，把用户显式提供的 ``trade_date`` 写入 ``analysis_date``
+   （仅 general 生效，且只写 analysis_date、不回写 trade_date）。
 """
 from __future__ import annotations
 
@@ -43,6 +50,7 @@ from app.services.workflow_registry import (
 from app.services.unified_analysis_engine import (
     GENERAL_TICKER_SENTINEL,
     apply_general_ticker_fallback,
+    apply_general_trade_date_fallback,
 )
 
 
@@ -196,6 +204,68 @@ def test_fallback_ignores_blank_target():
 def test_fallback_strips_whitespace():
     wi = {"task_category": "general", "analysis_target": "  盘面复盘  "}
     assert apply_general_ticker_fallback(wi) == "盘面复盘"
+
+
+# ==================== apply_general_trade_date_fallback ====================
+
+
+def test_trade_date_fallback_writes_analysis_date_for_general():
+    """general + 无 analysis_date + 有 trade_date → 写入 analysis_date。"""
+    wi = {"task_category": "general", "trade_date": "2026-10-15"}
+    assert apply_general_trade_date_fallback(wi) == "2026-10-15"
+    assert wi["analysis_date"] == "2026-10-15"
+
+
+def test_trade_date_fallback_noop_for_non_general():
+    """非 general 任务即便带 trade_date 也不写（避免污染单股/ETF 的取证日期）。"""
+    wi = {"task_category": "stock_analysis", "trade_date": "2026-10-15"}
+    assert apply_general_trade_date_fallback(wi) is None
+    assert "analysis_date" not in wi
+
+
+def test_trade_date_fallback_noop_without_task_category():
+    wi = {"trade_date": "2026-10-15"}
+    assert apply_general_trade_date_fallback(wi) is None
+    assert "analysis_date" not in wi
+
+
+def test_trade_date_fallback_does_not_override_existing_analysis_date():
+    """已有 analysis_date 时不得被 trade_date 覆盖（显式给定优先）。"""
+    wi = {"task_category": "general", "analysis_date": "2026-01-01", "trade_date": "2026-10-15"}
+    assert apply_general_trade_date_fallback(wi) is None
+    assert wi["analysis_date"] == "2026-01-01"
+
+
+def test_trade_date_fallback_noop_when_trade_date_missing_or_blank():
+    """trade_date 缺省 / None / 空串 / 空白串 一律视为未提供。"""
+    for wi in (
+        {"task_category": "general"},
+        {"task_category": "general", "trade_date": None},
+        {"task_category": "general", "trade_date": ""},
+        {"task_category": "general", "trade_date": "   "},
+    ):
+        assert apply_general_trade_date_fallback(wi) is None, wi
+        assert "analysis_date" not in wi, wi
+
+
+def test_trade_date_fallback_gate_is_case_and_space_insensitive():
+    for value in ("general", "GENERAL", " General ", "general\t"):
+        wi = {"task_category": value, "trade_date": "2026-10-15"}
+        assert apply_general_trade_date_fallback(wi) == "2026-10-15", value
+        assert wi["analysis_date"] == "2026-10-15"
+
+
+def test_trade_date_fallback_strips_value():
+    wi = {"task_category": "general", "trade_date": "  2026-10-15  "}
+    assert apply_general_trade_date_fallback(wi) == "2026-10-15"
+    assert wi["analysis_date"] == "2026-10-15"
+
+
+def test_trade_date_fallback_never_rewrites_trade_date():
+    """核心约束：兜底只写 analysis_date，绝不回写 trade_date。"""
+    wi = {"task_category": "general", "trade_date": "2026-10-15"}
+    apply_general_trade_date_fallback(wi)
+    assert wi["trade_date"] == "2026-10-15"
 
 
 # ==================== P1-1：custom_params 无过滤合并（入口侧契约） ====================
