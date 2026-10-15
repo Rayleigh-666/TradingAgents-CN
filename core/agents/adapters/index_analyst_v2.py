@@ -14,6 +14,7 @@ from core.agents.analyst import AnalystAgent
 from core.agents.config import AgentMetadata, AgentCategory, LicenseTier, AgentInput, AgentOutput
 from core.agents.registry import register_agent
 from core.agents.utils.data_source_mode import resolve_market_data_mode
+from core.tools.trade_date_policy import apply_stable_data_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,48 @@ def _build_lookback_days_directive(value: Any) -> str:
     )
 
 
+def _build_index_cache_identity(
+    trade_date: str,
+    *,
+    include_margin: Any = None,
+    lookback_days: Any = None,
+) -> tuple[str, str, str]:
+    """返回 (缓存符号, 请求日期, 有效数据日期)。
+
+    符号形如 ``market_v2__req_20260421__eff_20260420``；仅当对应参数**确有值**时
+    才追加后缀，从而既满足既有规格测试（不传参数时符号逐字不变），
+    又能区分「同一天但两融开关/回溯天数不同」的分析结果——否则缓存会把
+    这两个流程级参数的效果吃掉。
+
+    为什么 include_margin / lookback_days 必须进缓存键：
+    这两个参数会改变实际参与分析的工具集合与提示词内容
+    （``_get_tool_ids_for_mode`` 会因 include_margin=False 移除 get_margin_trading，
+    ``_build_user_prompt`` 会因 lookback_days 追加回溯指令），
+    因此同一天的不同参数设置产出的是语义不同的报告。
+    若缓存键只含日期，当天第二次运行就会命中第一次的报告，令这两个
+    流程参数形同虚设。缺省（True/None/空）时不追加后缀，保证单股/ETF
+    等既有流程的缓存符号逐字不变、向后兼容。
+    """
+    effective_date = apply_stable_data_cutoff(trade_date, cutoff_hour=19)
+
+    # 日期在符号里规范成 YYYYMMDD（去掉 "-"）
+    requested_token = str(trade_date).replace("-", "")
+    effective_token = str(effective_date).replace("-", "")
+    symbol = f"market_v2__req_{requested_token}__eff_{effective_token}"
+
+    # 仅在两融工具被显式关闭时区分；True（默认行为）与 None（缺省）不进键
+    if include_margin is False:
+        symbol += "__nomargin"
+
+    # 回溯天数确有空值时进键（0 视为有效值）
+    if lookback_days is not None and not (
+        isinstance(lookback_days, str) and not lookback_days.strip()
+    ):
+        symbol += f"__lb{lookback_days}"
+
+    return symbol, trade_date, effective_date
+
+
 def _get_cache_manager():
     """获取缓存管理器（延迟加载避免循环导入）"""
     try:
@@ -46,12 +89,19 @@ def _get_cache_manager():
         return None
 
 
-def _get_cached_index_report(trade_date: str) -> Optional[str]:
+def _get_cached_index_report(
+    trade_date: str,
+    *,
+    include_margin: Any = None,
+    lookback_days: Any = None,
+) -> Optional[str]:
     """
     从缓存获取大盘分析报告
 
     Args:
         trade_date: 交易日期
+        include_margin: 是否启用两融工具（None/True 为默认行为，False 单独成键）
+        lookback_days: 统一回溯天数（有值时单独成键）
 
     Returns:
         缓存的报告内容，如果没有命中则返回 None
@@ -61,20 +111,23 @@ def _get_cached_index_report(trade_date: str) -> Optional[str]:
         return None
 
     try:
-        # 大盘分析不依赖具体股票，使用 "market_v2" 作为 symbol 区分 v1.x
+        # 大盘分析不依赖具体股票，使用缓存身份区分 v1.x、有效数据日期与流程参数
+        symbol, _, _ = _build_index_cache_identity(
+            trade_date, include_margin=include_margin, lookback_days=lookback_days
+        )
         # 🔑 确保 max_age_hours 是整数
         max_age_hours = int(INDEX_REPORT_CACHE_TTL_HOURS) if INDEX_REPORT_CACHE_TTL_HOURS else 1
         
         cache_key = cache.find_cached_analysis_report(
             report_type="index_report",
-            symbol="market_v2",
+            symbol=symbol,
             trade_date=trade_date,
             max_age_hours=max_age_hours
         )
         if cache_key:
             report = cache.load_analysis_report(cache_key)
             if report and len(report) > 100:
-                logger.info(f"📦 [大盘分析师v2] 命中缓存: @ {trade_date}")
+                logger.info(f"📦 [大盘分析师v2] 命中缓存: symbol={symbol} @ {trade_date}")
                 return report
     except Exception as e:
         logger.warning(f"⚠️ 读取大盘分析缓存失败: {e}")
@@ -82,13 +135,21 @@ def _get_cached_index_report(trade_date: str) -> Optional[str]:
     return None
 
 
-def _save_index_report_to_cache(trade_date: str, report: str) -> bool:
+def _save_index_report_to_cache(
+    trade_date: str,
+    report: str,
+    *,
+    include_margin: Any = None,
+    lookback_days: Any = None,
+) -> bool:
     """
     将大盘分析报告保存到缓存
 
     Args:
         trade_date: 交易日期
         report: 报告内容
+        include_margin: 是否启用两融工具（None/True 为默认行为，False 单独成键）
+        lookback_days: 统一回溯天数（有值时单独成键）
 
     Returns:
         是否保存成功
@@ -98,17 +159,21 @@ def _save_index_report_to_cache(trade_date: str, report: str) -> bool:
         return False
 
     try:
+        symbol, _, _ = _build_index_cache_identity(
+            trade_date, include_margin=include_margin, lookback_days=lookback_days
+        )
+
         # 🔍 调试日志：记录缓存参数
-        logger.debug(f"💾 [大盘分析师v2] 准备缓存: trade_date={trade_date}, "
+        logger.debug(f"💾 [大盘分析师v2] 准备缓存: symbol={symbol}, trade_date={trade_date}, "
                      f"trade_date_type={type(trade_date).__name__}, report_len={len(report)}")
 
         cache.save_analysis_report(
             report_type="index_report",
             report_data=report,
-            symbol="market_v2",
+            symbol=symbol,
             trade_date=trade_date
         )
-        logger.info(f"💾 [大盘分析师v2] 报告已缓存: @ {trade_date} ({INDEX_REPORT_CACHE_TTL_HOURS}小时有效)")
+        logger.info(f"💾 [大盘分析师v2] 报告已缓存: symbol={symbol} @ {trade_date} ({INDEX_REPORT_CACHE_TTL_HOURS}小时有效)")
         return True
     except Exception as e:
         # 🔍 增强错误日志：记录完整堆栈
@@ -289,7 +354,11 @@ class IndexAnalystV2(AnalystAgent):
         if is_debug_mode or skip_cache:
             logger.info(f"🔧 [大盘分析师v2] 跳过缓存 (debug={is_debug_mode}, skip_cache={skip_cache})")
         else:
-            cached_report = _get_cached_index_report(analysis_date)
+            cached_report = _get_cached_index_report(
+                analysis_date,
+                include_margin=state.get("include_margin"),
+                lookback_days=state.get("lookback_days"),
+            )
             if cached_report:
                 logger.info(f"🌐 [大盘分析师v2] 使用缓存报告 ({len(cached_report)} 字符)")
                 return {
@@ -304,7 +373,12 @@ class IndexAnalystV2(AnalystAgent):
         # 💾 保存到缓存
         report = result.get("index_report", "")
         if report and isinstance(report, str) and len(report) > 100:
-            _save_index_report_to_cache(analysis_date, report)
+            _save_index_report_to_cache(
+                analysis_date,
+                report,
+                include_margin=state.get("include_margin"),
+                lookback_days=state.get("lookback_days"),
+            )
 
         return result
 
