@@ -127,9 +127,9 @@ def get_technical_indicators(
                 logger.warning(f"港股数据获取失败: {e}")
                 
         elif is_us:
-            from tradingagents.dataflows.providers.us.optimized import OptimizedUSProvider
+            from tradingagents.dataflows.providers.us.optimized import OptimizedUSDataProvider
             try:
-                provider = OptimizedUSProvider()
+                provider = OptimizedUSDataProvider()
                 df = provider.get_daily_data(ticker, start_date, end_date)
             except Exception as e:
                 logger.warning(f"美股数据获取失败: {e}")

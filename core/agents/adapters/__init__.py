@@ -47,6 +47,8 @@ from .safe_analyst_v2 import SafeAnalystV2
 from .neutral_analyst_v2 import NeutralAnalystV2
 from .risk_self_debate_v2 import RiskSelfDebateV2
 from .chip_distribution_analyst_v2 import ChipDistributionAnalystV2
+# 组合级分析师（持仓组合健康度体检）：直接读 state["holdings"] 做确定性计算
+from .portfolio_analyst_v2 import PortfolioAnalystV2
 
 # 复盘相关智能体 (v1 & v2)
 from .review import (
@@ -100,6 +102,7 @@ __all__ = [
     "IndexAnalystV2",
     "ChipDistributionAnalystV2",
     "RiskSelfDebateV2",
+    "PortfolioAnalystV2",
     # 复盘相关 (v1)
     "TimingAnalystAgent",
     "PositionAnalystAgent",

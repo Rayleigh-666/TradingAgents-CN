@@ -93,8 +93,7 @@ class TestTradeReviewTools:
         expected_tools = [
             "get_trade_records",
             "build_trade_info",
-            "get_account_info",
-            "get_market_snapshot_for_review"
+            "get_account_info"
         ]
 
         for tool_id in expected_tools:
@@ -141,8 +140,7 @@ class TestTradeReviewTools:
         expected_tools = [
             "get_trade_records",
             "build_trade_info",
-            "get_account_info",
-            "get_market_snapshot_for_review"
+            "get_account_info"
         ]
 
         for tool_id in expected_tools:

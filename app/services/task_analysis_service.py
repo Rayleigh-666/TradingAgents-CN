@@ -1536,7 +1536,7 @@ class TaskAnalysisService:
             "key_points": key_points,  # 🔥 关键要点（从 reasoning 或 summary 中提取）
             "execution_time": task.execution_time or 0,
             "tokens_used": raw_result.get("tokens_used", 0),
-            "analysts": task.task_params.get("selected_analysts", []),
+            "analysts": task.task_params.get("selected_analysts") or [],
             "research_depth": task.task_params.get("research_depth", "快速"),
             "reports": reports,
             "decision": formatted_decision,

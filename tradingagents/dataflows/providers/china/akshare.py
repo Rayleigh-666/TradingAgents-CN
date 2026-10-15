@@ -2005,13 +2005,35 @@ class AKShareProvider(BaseStockDataProvider):
                 "error": str(e)
             }
 
-    def get_stock_news_sync(self, symbol: str = None, limit: int = 10) -> Optional[pd.DataFrame]:
+    @staticmethod
+    def _normalize_market_date(market_date: Optional[str]) -> Optional[str]:
+        """把 ``market_date`` 归一化成 ``ak.news_cctv`` 需要的 ``YYYYMMDD`` 字符串。
+
+        支持 ``2026-10-14`` / ``2026/10/14`` / ``20261014``；无法解析时返回 ``None``。
+        """
+        if not market_date:
+            return None
+        raw = str(market_date).strip()
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(raw, fmt).strftime("%Y%m%d")
+            except ValueError:
+                continue
+        return None
+
+    def get_stock_news_sync(
+        self, symbol: str = None, limit: int = 10, market_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
         """
         获取股票新闻（同步版本，返回原始 DataFrame）
 
         Args:
             symbol: 股票代码，为None时获取市场新闻
             limit: 返回数量限制
+            market_date: 大盘/全市场新闻（symbol 为 None 时）所需的分析日期，接受
+                ``YYYY-MM-DD`` / ``YYYYMMDD``；缺失时不会回落到写死的默认日期。
 
         Returns:
             新闻 DataFrame 或 None
@@ -2065,10 +2087,21 @@ class AKShareProvider(BaseStockDataProvider):
             else:
                 # 获取市场新闻
                 self.logger.debug("📰 获取AKShare市场新闻")
-                news_df = ak.news_cctv()
+                # ⚠️ ak.news_cctv 的默认 date 是写死的 '20240424'，不带日期会静默返回
+                # 2024-04 的旧闻。这里在缺失有效日期时直接报错返回，绝不静默降级。
+                date_str = self._normalize_market_date(market_date)
+                if not date_str:
+                    self.logger.error(
+                        "❌ 获取AKShare市场新闻缺少有效日期：ak.news_cctv 的 date 默认值为写死的 "
+                        "'20240424'，为避免返回过期年份新闻，拒绝在无明确日期时调用。"
+                        "请传入 market_date=YYYY-MM-DD。"
+                    )
+                    return None
+
+                news_df = ak.news_cctv(date=date_str)
 
                 if news_df is not None and not news_df.empty:
-                    self.logger.info(f"✅ AKShare市场新闻获取成功: {len(news_df)} 条")
+                    self.logger.info(f"✅ AKShare市场新闻获取成功: {len(news_df)} 条 (date={date_str})")
                     return news_df.head(limit) if limit else news_df
                 else:
                     self.logger.warning("⚠️ 未获取到AKShare市场新闻数据")
@@ -2078,13 +2111,17 @@ class AKShareProvider(BaseStockDataProvider):
             self.logger.error(f"❌ AKShare新闻获取失败: {e}")
             return None
 
-    async def get_stock_news(self, symbol: str = None, limit: int = 10) -> Optional[List[Dict[str, Any]]]:
+    async def get_stock_news(
+        self, symbol: str = None, limit: int = 10, market_date: Optional[str] = None
+    ) -> Optional[List[Dict[str, Any]]]:
         """
         获取股票新闻（异步版本，返回结构化列表）
 
         Args:
             symbol: 股票代码，为None时获取市场新闻
             limit: 返回数量限制
+            market_date: 大盘/全市场新闻（symbol 为 None 时）所需的分析日期，接受
+                ``YYYY-MM-DD`` / ``YYYYMMDD``；缺失时不会回落到写死的默认日期。
 
         Returns:
             新闻列表
@@ -2213,11 +2250,22 @@ class AKShareProvider(BaseStockDataProvider):
                 # 获取市场新闻
                 self.logger.debug("📰 获取AKShare市场新闻")
 
+                # ak.news_cctv 不接受 limit 参数，也无写死的默认日期可用：缺失有效
+                # date 时必须显式报错并返回 None，绝不静默返回旧年份数据。
+                date_str = self._normalize_market_date(market_date)
+                if not date_str:
+                    self.logger.error(
+                        "❌ 获取AKShare市场新闻缺少有效日期：ak.news_cctv 的 date 默认值为写死的 "
+                        "'20240424'，为避免返回过期年份新闻，拒绝在无明确日期时调用。"
+                        "请传入 market_date=YYYY-MM-DD。"
+                    )
+                    return None
+
                 try:
-                    # 获取财经新闻
+                    # 获取财经新闻（ak.news_cctv 仅接受 date=YYYYMMDD，不接受 limit）
                     news_df = await asyncio.to_thread(
                         ak.news_cctv,
-                        limit=limit
+                        date=date_str
                     )
 
                     if news_df is not None and not news_df.empty:
@@ -2235,7 +2283,7 @@ class AKShareProvider(BaseStockDataProvider):
                                 "url": str(row.get('url', '') or row.get('链接', '')),
                                 "source": str(row.get('source', '') or row.get('来源', '') or 'CCTV财经'),
                                 "author": str(row.get('author', '') or ''),
-                                "publish_time": self._parse_news_time(row.get('time', '') or row.get('时间', '')),
+                                "publish_time": self._parse_news_time(row.get('date', '') or row.get('time', '') or row.get('时间', '')),
                                 "category": self._classify_news(content, title),
                                 "sentiment": self._analyze_news_sentiment(content, title),
                                 "sentiment_score": self._calculate_sentiment_score(content, title),
@@ -2247,11 +2295,12 @@ class AKShareProvider(BaseStockDataProvider):
                             if news_item["title"]:
                                 news_list.append(news_item)
 
-                        self.logger.info(f"✅ AKShare市场新闻获取成功: {len(news_list)} 条")
+                        self.logger.info(f"✅ AKShare市场新闻获取成功: {len(news_list)} 条 (date={date_str})")
                         return news_list
 
                 except Exception as e:
-                    self.logger.debug(f"CCTV新闻获取失败: {e}")
+                    self.logger.error(f"❌ AKShare市场新闻(CCTV)获取失败 (date={date_str}): {e}")
+                    return None
 
                 return []
 
@@ -2274,7 +2323,8 @@ class AKShareProvider(BaseStockDataProvider):
                 "%Y/%m/%d %H:%M",
                 "%Y/%m/%d",
                 "%m-%d %H:%M",
-                "%m/%d %H:%M"
+                "%m/%d %H:%M",
+                "%Y%m%d"
             ]
 
             for fmt in formats:

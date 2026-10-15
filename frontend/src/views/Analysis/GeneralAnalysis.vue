@@ -716,6 +716,7 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { isJdyunMode, JDYUN_CHAT_MODELS, loadJdyunChatModels } from '@/utils/config'
 import { renderMarkdown as safeMarkdown } from '@/utils/markdown'
+import { looksLikeInstrumentCode } from '@/utils/market'
 
 const router = useRouter()
 
@@ -1020,11 +1021,11 @@ const handleExecute = async () => {
       }
     }
 
-    // 如果没有 ticker 字段但有 analysis_target，复用作为 ticker（工作流引擎需要 ticker 做参数映射）
-    if (!params.ticker) {
-      if (params.analysis_target) {
-        params.ticker = params.analysis_target
-      }
+    // 如果没有 ticker 字段但有 analysis_target：仅当 analysis_target 看起来像真实代码时
+    // 才复用为 ticker（工作流引擎需要 ticker 做参数映射）。自由文本分析目标（如
+    // 「A股市场当日盘面复盘」）绝不能被当作 ticker，否则会污染下游 symbol/市场识别。
+    if (!params.ticker && params.analysis_target && looksLikeInstrumentCode(params.analysis_target)) {
+      params.ticker = params.analysis_target
     }
 
     // 所有参数合并到 custom_params 中
@@ -1034,16 +1035,19 @@ const handleExecute = async () => {
 
     const result = await workflowApi.execute(selectedWorkflowId.value, params)
 
-    if (result.success && result.task_id) {
+    // 成功判据看 task_id（后端返回 data 载荷；不要依赖 success 标志）
+    if (result?.task_id) {
       taskId.value = result.task_id
       ElMessage.success('分析任务已创建')
       startPolling()
     } else {
-      throw new Error(result.error || result.message || '未获取到任务ID')
+      // 失败提示：优先 error，其次后端 message，最后兜底文案
+      throw new Error(result?.error || result?.message || '未获取到任务ID，请检查后端日志')
     }
-  } catch (e: any) {
+  } catch (e) {
     taskStatus.value = 'failed'
-    errorMessage.value = e?.message || '执行失败'
+    const msg = e instanceof Error ? e.message : String(e)
+    errorMessage.value = msg || '执行失败'
     ElMessage.error(errorMessage.value)
     stopElapsedTimer()
   } finally {
@@ -1083,6 +1087,14 @@ const startPolling = () => {
         stopPolling()
         stopElapsedTimer()
         ElMessage.error('分析失败')
+      } else if (st === 'cancelled' || st === 'canceled') {
+        // 后端会把 cancelled 原样透出（见 app/routers/analysis.py 状态映射）；
+        // 若这里不终止轮询，任务被取消后页面会一直空转
+        taskStatus.value = 'failed'
+        errorMessage.value = status.error || status.error_message || '任务已取消'
+        stopPolling()
+        stopElapsedTimer()
+        ElMessage.warning('任务已取消')
       }
     } catch (e) {
       console.error('查询任务状态失败', e)

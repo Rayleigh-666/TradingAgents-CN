@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 
 A_SHARE_NEWS_LOOKBACK_DAYS = 7
+# 大盘/全市场新闻兜底相关配置（未知市场走 ak.news_cctv 大盘新闻）
+#
+# ``MARKET_NEWS_MAX_DATE_FETCHES`` 是「按自然日逐个请求」的次数上限。
+# ``ak.news_cctv`` 只接受单日 ``date``，因此窗口内每一天都要单独请求一次；
+# 上限必须与查询窗口 ``A_SHARE_NEWS_LOOKBACK_DAYS`` 一致，否则窗口里更早的
+# 那几天永远取不到且不报错（历史上写死为 3，7 天窗口里只有最近 3 天被请求）。
+MARKET_NEWS_MAX_DATE_FETCHES = A_SHARE_NEWS_LOOKBACK_DAYS
+MARKET_NEWS_SOURCE_NAME = "央视新闻"
+MARKET_NEWS_MARKET_NAME = "未知市场（按全市场新闻兜底）"
+MARKET_NEWS_COMPANY_NAME = "全市场"
 TUSHARE_LIVE_SOURCES = [
     "sina",
     "eastmoney",
@@ -260,6 +270,33 @@ def _format_publish_time(value: Any) -> str:
     if parsed is not None:
         return parsed.strftime("%Y-%m-%d %H:%M")
     return _collapse_whitespace(value) or "未知时间"
+
+
+def _parse_market_news_time(value: Any) -> Optional[datetime]:
+    """解析大盘新闻发布时间。
+
+    AKShare ``ak.news_cctv`` 的日期字段为 ``YYYYMMDD``（如 ``20261014``），
+    与个股新闻（``ak.stock_news_em``）的 ``YYYY-MM-DD HH:MM:SS`` 不同，
+    因此单独解析，避免误用个股分支的格式导致发布时间为空。
+    """
+    if isinstance(value, datetime):
+        return value
+
+    text = _collapse_whitespace(value)
+    if not text:
+        return None
+
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d%H%M%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        logger.debug(f"⚠️ [统一新闻工具] 无法解析大盘新闻时间: {text}")
+        return None
 
 
 def _coerce_keywords(value: Any) -> List[str]:
@@ -663,6 +700,51 @@ def _get_top_relevance_score(news_list: List[Dict[str, Any]]) -> int:
     return int(news_list[0].get("relevance_score", 0) or 0)
 
 
+def _calculate_market_news_relevance(news_item: Dict[str, Any]) -> int:
+    """计算大盘/全市场新闻的相关性评分。
+
+    大盘新闻没有个股 ``symbol``，因此不复用依赖 symbol+company_name 的
+    ``_calculate_a_share_news_relevance``，改用大盘语境（市场/指数/板块等）
+    与重要性的轻量启发式，避免给出失真的相关性分值。
+    """
+    title = _collapse_whitespace(news_item.get("title"))
+    importance = _collapse_whitespace(news_item.get("importance"))
+
+    score = 50
+    if _contains_any_keyword(title, A_SHARE_BROAD_CONTEXT_KEYWORDS):
+        score += 20
+    if _contains_any_keyword(title, A_SHARE_DIRECT_EVENT_KEYWORDS):
+        score += 10
+    if importance == "high":
+        score += 15
+    elif importance == "medium":
+        score += 7
+
+    return max(0, min(100, score))
+
+
+def _rank_market_news_items(
+    news_list: List[Dict[str, Any]],
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """对大盘/全市场新闻排序：以发布时间倒序为主，相关性作为同段时间的次要排序。"""
+    ranked_news = []
+
+    for news in news_list:
+        ranked_item = dict(news)
+        ranked_item["relevance_score"] = _calculate_market_news_relevance(ranked_item)
+        ranked_news.append(ranked_item)
+
+    ranked_news.sort(
+        key=lambda item: (
+            _parse_publish_time(item.get("publish_time")) or datetime.min,
+            item.get("relevance_score", 0),
+        ),
+        reverse=True,
+    )
+    return ranked_news[:limit]
+
+
 def _select_best_live_news_source(
     source_news_map: Dict[str, List[Dict[str, Any]]],
     live_source_plan: List[str],
@@ -971,13 +1053,152 @@ def _fetch_tushare_news_live(
     return final_news
 
 
+def _fetch_akshare_market_news_live(
+    start_date: datetime,
+    end_date: datetime,
+    limit: int = 20,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """按分析日期窗口从 AKShare 拉取大盘/全市场新闻（``ak.news_cctv``）。
+
+    这里直接调用 ``ak.news_cctv(date=YYYYMMDD)`` 而**不是** provider 的
+    ``AKShareProvider.get_stock_news(symbol=None, market_date=...)``，原因不是
+    provider 不可用（它现在可用，见
+    ``tradingagents/dataflows/providers/china/akshare.py`` 的 ``get_stock_news_sync``
+    / ``get_stock_news`` 大盘分支：只传 ``date``、不传 ``limit``，缺日期时显式
+    返回 None 而非静默回落写死的 ``20240424``），而是**职责差异**：
+    provider 是**单日**接口，本工具层需要对「分析日往前 N 天」的窗口**逐日循环**
+    取数并聚合，因此保留直连以掌握日期循环与聚合逻辑。
+
+    Returns:
+        (items, status)：
+        - items: 已按窗口过滤的结构化新闻列表；
+        - status: ``{"reachable": bool, "raw_count": int, "matched_count": int,
+          "fetched_dates": List[str], "error": Optional[str]}``，
+          用于区分「数据源不可达」与「数据源可达但窗口内无新闻」。
+    """
+    try:
+        import akshare as ak
+    except Exception as exc:
+        logger.warning(f"⚠️ [统一新闻工具] 导入 AKShare 失败，大盘新闻不可达: {exc}")
+        return [], {
+            "reachable": False,
+            "raw_count": 0,
+            "matched_count": 0,
+            "fetched_dates": [],
+            "error": f"导入 AKShare 失败: {exc}",
+        }
+
+    import asyncio
+
+    candidate_limit = max(limit, 20)
+    collected_rows: List[Dict[str, Any]] = []
+    fetched_dates: List[str] = []
+    reachable = False
+    error_messages: List[str] = []
+
+    current_day = end_date.date()
+    start_day = start_date.date()
+    fetched_attempts = 0
+
+    while current_day >= start_day and fetched_attempts < MARKET_NEWS_MAX_DATE_FETCHES:
+        if len(collected_rows) >= candidate_limit:
+            break
+
+        date_str = current_day.strftime("%Y%m%d")
+        fetched_attempts += 1
+        fetched_dates.append(date_str)
+        logger.info(f"📰 [统一新闻工具] 尝试 AKShare 大盘新闻: date={date_str}")
+
+        try:
+            news_df = _run_async_in_thread(
+                lambda ds=date_str: asyncio.to_thread(ak.news_cctv, date=ds),
+                timeout=30.0,
+            )
+        except concurrent.futures.TimeoutError as exc:
+            error_messages.append(f"{date_str}: 超时")
+            logger.warning(f"⚠️ [统一新闻工具] AKShare 大盘新闻 {date_str} 超时")
+        except Exception as exc:
+            error_messages.append(f"{date_str}: {exc}")
+            logger.warning(f"⚠️ [统一新闻工具] AKShare 大盘新闻 {date_str} 获取失败: {exc}")
+        else:
+            reachable = True
+            # 鸭子类型守卫（getattr 兜底 .empty）是为了容忍非 DataFrame 的返回值；
+            # 但它不能保证对象有 .iterrows，因此这里再显式校验 isinstance(pd.DataFrame)，
+            # 避免「truthy 且 empty 为假却没有 iterrows」的对象在下一行抛 AttributeError。
+            if news_df is not None and not getattr(news_df, "empty", True):
+                import pandas as pd  # 局部 import：保持本文件既有的按需引入风格
+
+                if isinstance(news_df, pd.DataFrame):
+                    for _, row in news_df.iterrows():
+                        row_dict = dict(row)
+                        title = _collapse_whitespace(row_dict.get("title") or row_dict.get("标题"))
+                        if not title:
+                            continue
+                        publish_time = _parse_market_news_time(
+                            row_dict.get("date") or row_dict.get("时间") or date_str
+                        )
+                        if publish_time is None:
+                            publish_time = _parse_market_news_time(date_str)
+                        collected_rows.append(
+                            {
+                                "title": title,
+                                "content": _collapse_whitespace(row_dict.get("content") or row_dict.get("内容")),
+                                "summary": _collapse_whitespace(row_dict.get("brief") or row_dict.get("摘要")),
+                                "url": _collapse_whitespace(row_dict.get("url") or row_dict.get("链接")),
+                                "source": MARKET_NEWS_SOURCE_NAME,
+                                "author": "",
+                                "publish_time": publish_time,
+                                "category": "market_news",
+                                "sentiment": "neutral",
+                                # 刻意不写 importance：大盘新闻本身没有重要性数据，
+                                # 历史上硬编码 "medium" 会被 _calculate_market_news_relevance
+                                # 统一 +7 分（且无区分度），属于自造字段自消费。
+                                # 缺省时 news_item.get("importance") 为 None → 不加分。
+                                "keywords": [],
+                                "data_source": "akshare",
+                            }
+                        )
+
+        current_day -= timedelta(days=1)
+
+    parsed_news = [news for news in collected_rows if news.get("publish_time") is not None]
+    filtered_news = _filter_news_by_date_range(parsed_news, start_date, end_date)
+    final_news = _deduplicate_news_items(filtered_news)[:candidate_limit]
+
+    status = {
+        "reachable": reachable,
+        "raw_count": len(collected_rows),
+        "matched_count": len(final_news),
+        "fetched_dates": fetched_dates,
+        "error": "; ".join(error_messages) if error_messages else None,
+    }
+    logger.info(
+        f"📰 [统一新闻工具] AKShare 大盘新闻链路: reachable={reachable}, "
+        f"raw={len(collected_rows)}, matched={len(final_news)}, dates={fetched_dates}"
+    )
+    return final_news, status
+
+
 def _fetch_akshare_news_live(
-    symbol: str,
+    symbol: Optional[str],
     start_date: datetime,
     end_date: datetime,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
-    """从 AKShare 拉取结构化新闻，并严格按分析日期窗口过滤。"""
+    """从 AKShare 拉取结构化新闻，并严格按分析日期窗口过滤。
+
+    ``symbol=None`` 时进入大盘/全市场模式，交由
+    :func:`_fetch_akshare_market_news_live` 处理（逐日循环 ``ak.news_cctv``；
+    provider 大盘分支虽可用但为单日接口，见该函数说明）。
+    """
+    if not symbol:
+        market_news, _market_status = _fetch_akshare_market_news_live(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        return market_news
+
     logger.info(
         f"📰 [统一新闻工具] 尝试 AKShare 实时新闻: symbol={symbol}, "
         f"window={start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}"
@@ -1552,31 +1773,86 @@ def _build_us_news_bundle(ticker: str, curr_date: str, limit: int = 20) -> Dict[
     }
 
 
-def _build_stock_news_bundle(ticker: str, curr_date: str, limit: int = 20) -> Dict[str, Any]:
-    """按市场构建统一新闻候选集。"""
-    from tradingagents.utils.stock_utils import StockUtils
+def _build_market_news_footer(status: Dict[str, Any]) -> str:
+    """生成大盘/全市场新闻的尾部说明，区分「数据源不可达」与「确实无新闻」。"""
+    window_days = A_SHARE_NEWS_LOOKBACK_DAYS
+    footer_lines = [
+        "---",
+        f"*本条为全市场/大盘级新闻（非个股），来自 AKShare 央视新闻（ak.news_cctv），按分析日往前 {window_days} 天窗口过滤。*",
+    ]
 
-    market_info = StockUtils.get_market_info(ticker)
-    curr_date_clean = _normalize_analysis_date(curr_date)
+    if not status.get("reachable"):
+        error_text = _collapse_whitespace(status.get("error")) or "未知错误"
+        footer_lines.append(
+            f"*⚠️ 数据源不可达：大盘新闻数据源本次调用失败（{error_text}），"
+            "不代表“确实没有新闻”。*"
+        )
+    elif not status.get("matched_count"):
+        footer_lines.append("*数据源可达，但查询窗口内未匹配到可用的全市场新闻条目。*")
+    else:
+        footer_lines.append(
+            f"*数据源可达，窗口内命中 {status.get('matched_count')} 条全市场新闻标题。*"
+        )
 
-    if market_info["is_china"]:
-        return _build_a_share_news_bundle(ticker, curr_date_clean, limit=limit)
-    if market_info["is_hk"]:
-        return _build_hk_news_bundle(ticker, curr_date_clean, limit=limit)
-    if market_info["is_us"]:
-        return _build_us_news_bundle(ticker, curr_date_clean, limit=limit)
+    return "\n".join(footer_lines)
 
-    _, _, start_date_str, end_date_str = _build_a_share_news_window(curr_date_clean)
+
+def _build_market_news_bundle(ticker: str, curr_date: str, limit: int = 20) -> Dict[str, Any]:
+    """构建大盘/全市场新闻候选集（未知市场兜底）。"""
+    start_date, end_date, start_date_str, end_date_str = _build_a_share_news_window(curr_date)
+    candidate_limit = max(limit * 3, 30)
+
+    market_news, market_status = _fetch_akshare_market_news_live(
+        start_date=start_date,
+        end_date=end_date,
+        limit=candidate_limit,
+    )
+    ranked_news = _rank_market_news_items(market_news, limit=candidate_limit)
+    merged_candidates = _merge_news_items_by_title(ranked_news, limit=candidate_limit)
+    annotated_items = _annotate_headline_items(merged_candidates, limit=limit)
+
     return {
         "ticker": ticker,
-        "market_name": market_info.get("market_name", "未知市场"),
-        "analysis_date": curr_date_clean,
+        "market_name": MARKET_NEWS_MARKET_NAME,
+        "analysis_date": curr_date,
         "start_date": start_date_str,
         "end_date": end_date_str,
-        "company_name": ticker,
-        "items": [],
-        "footer_note": "",
+        "company_name": MARKET_NEWS_COMPANY_NAME,
+        "items": annotated_items,
+        "footer_note": _build_market_news_footer(market_status),
     }
+
+
+def _build_stock_news_bundle(ticker: str, curr_date: str, limit: int = 20) -> Dict[str, Any]:
+    """按市场构建统一新闻候选集。
+
+    市场识别统一走 ``app.core.market_codes.resolve_instrument``（铁律口径）：
+    它先做「像不像证券代码」的形态判断，再定市场并归一化出内部 symbol。
+    不能用 ``StockUtils.get_market_info``（纯数字 4~5 位港股如 ``"700"`` 会落
+    UNKNOWN，从而错误地走全市场兜底），也**不能**只补一层 ``guess_market``——
+    后者的「含字母 → us」规则会把含拉丁字母 A 的中文自由文本（如
+    「A股市场当日盘面复盘」）误判成美股。``resolve_instrument`` 对自由文本
+    返回 ``("", "")``，因此能安全地区分「认不出的代码」与「自由文本」。
+    """
+    from app.core.market_codes import resolve_instrument
+
+    market, symbol = resolve_instrument(ticker)
+    curr_date_clean = _normalize_analysis_date(curr_date)
+
+    if market == "cn":
+        return _build_a_share_news_bundle(symbol, curr_date_clean, limit=limit)
+    if market == "hk":
+        return _build_hk_news_bundle(symbol, curr_date_clean, limit=limit)
+    if market == "us":
+        return _build_us_news_bundle(symbol, curr_date_clean, limit=limit)
+
+    # 未识别为证券代码（自由文本 / __GENERAL__ / MARKET / 空串）不再直接短路成空 items，
+    # 改为按日期查询全市场/大盘新闻兜底。
+    logger.info(
+        "📰 [统一新闻工具] 未识别为证券代码，回退到全市场新闻兜底: ticker=%s",
+        ticker,
+    )
+    return _build_market_news_bundle(ticker, curr_date_clean, limit=limit)
 
 
 def _build_a_share_footer(enabled_sources: List[str]) -> str:
@@ -1635,13 +1911,18 @@ def get_stock_news_headlines_unified(
         news_items = bundle.get("items") or []
 
         if not news_items:
-            return (
+            empty_text = (
                 f"# {ticker} 新闻标题候选\n\n"
                 f"**股票类型**: {bundle.get('market_name')}\n"
                 f"**分析日期**: {bundle.get('analysis_date')}\n"
                 f"**新闻时间范围**: {bundle.get('start_date')} 至 {bundle.get('end_date')}\n\n"
                 "## 新闻标题候选\n当前未获取到可用新闻标题。"
             )
+            # 仅在 footer_note 非空时才追加，避免给（个股等）正常空结果路径添噪；
+            # 大盘/全市场路径依赖它区分「数据源不可达」与「确实没有新闻」。
+            if _collapse_whitespace(bundle.get("footer_note")):
+                empty_text = f"{empty_text}\n\n{bundle.get('footer_note')}"
+            return empty_text
 
         result_parts = [
             f"# {ticker} 新闻标题候选",
@@ -1791,15 +2072,20 @@ def get_stock_news_unified(
     logger.info(f"📰 [统一新闻工具] 分析股票: {ticker}")
 
     try:
-        from tradingagents.utils.stock_utils import StockUtils
+        # 市场识别与 _build_stock_news_bundle **同源口径**：统一走
+        # app.core.market_codes.resolve_instrument（先判「像不像证券代码」再定市场并归一化）。
+        # 不能用 StockUtils.get_market_info —— 它把 1~3 位纯数字港股（如 "700" 腾讯）
+        # 判为 UNKNOWN，于是本函数 is_china/is_hk/is_us 全 False，直接报「无新闻」，
+        # 与 _build_stock_news_bundle（已走 resolve_instrument）行为不一致。
+        from app.core.market_codes import resolve_instrument
 
-        # 自动识别股票类型
-        market_info = StockUtils.get_market_info(ticker)
-        is_china = market_info["is_china"]
-        is_hk = market_info["is_hk"]
-        is_us = market_info["is_us"]
+        market, _symbol = resolve_instrument(ticker)
+        is_china = market == "cn"
+        is_hk = market == "hk"
+        is_us = market == "us"
+        market_name = {"cn": "中国A股", "hk": "港股", "us": "美股"}.get(market, "市场未识别")
 
-        logger.info(f"📰 [统一新闻工具] 股票类型: {market_info['market_name']}")
+        logger.info(f"📰 [统一新闻工具] 股票类型: {market_name}")
 
         curr_date_clean = _normalize_analysis_date(curr_date)
         start_date, end_date, start_date_str, end_date_str = _build_a_share_news_window(curr_date_clean)
@@ -1960,13 +2246,29 @@ def get_stock_news_unified(
             except Exception as google_e:
                 logger.error(f"❌ Google新闻获取异常: {google_e}")
 
+        else:
+            # 未识别为证券代码（自由文本 / MARKET / 空串）：与 _build_stock_news_bundle
+            # 同源，回退到全市场/大盘级新闻兜底，避免静默报「无新闻」。
+            logger.info(f"📰 [统一新闻工具] 未识别为证券代码，回退到全市场新闻兜底...")
+            market_bundle = _build_market_news_bundle(ticker, curr_date_clean, limit=20)
+            market_items = market_bundle.get("items") or []
+            if market_items:
+                result_data.append(
+                    _format_news_section(
+                        market_items,
+                        "全市场新闻",
+                        "未识别为证券代码，已回退到全市场/大盘级新闻",
+                    )
+                )
+            footer_note = market_bundle.get("footer_note") or ""
+
         if not result_data:
             result_data.append("## 新闻结果\n当前未获取到可用新闻数据。")
 
         # 组合所有数据
         combined_result = f"""# {ticker} 新闻分析
 
-**股票类型**: {market_info['market_name']}
+**股票类型**: {market_name}
 **分析日期**: {curr_date_clean}
 **新闻时间范围**: {start_date_str} 至 {end_date_str}
 

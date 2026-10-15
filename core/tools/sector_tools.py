@@ -812,7 +812,7 @@ async def analyze_sector(ticker: str, trade_date: str) -> str:
     整合板块表现、轮动趋势、同业对比三个维度的分析
 
     Args:
-        ticker: 目标股票代码（如果是 "MARKET" 则分析整体板块情况）
+        ticker: 目标股票代码（非证券代码形态，如空值/自由文本，则分析整体板块情况）
         trade_date: 交易日期
 
     Returns:
@@ -820,7 +820,17 @@ async def analyze_sector(ticker: str, trade_date: str) -> str:
     """
     try:
         # 判断是整体板块分析还是个股板块分析
-        is_market_analysis = (ticker == "MARKET" or not ticker)
+        #
+        # 判据 = 「是否具备证券代码形态」，**不能**用字面量 `ticker == "MARKET"`：
+        #   1) 通用研究工作流的哨兵值已由 "MARKET" 改为 "__GENERAL__"，字面量判据失效；
+        #   2) 通用研究流的 analysis_target 常是自由文本（如「新能源板块」），
+        #      字面量判据会让这类输入错误地落进「个股板块分析」分支，
+        #      进而拿自由文本去查成分股，产出错误报告。
+        # 统一收敛到 resolve_instrument：不像代码 → 大盘级轮动分析。
+        from app.core.market_codes import resolve_instrument
+
+        _market, _symbol = resolve_instrument(ticker or "")
+        is_market_analysis = not _symbol
 
         if is_market_analysis:
             # 整体板块分析：只分析板块轮动

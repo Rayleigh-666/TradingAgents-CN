@@ -853,7 +853,7 @@ BUILTIN_TOOLS: Dict[str, ToolMetadata] = {
     "get_market_snapshot_for_review": ToolMetadata(
         id="get_market_snapshot_for_review",
         name="获取市场快照",
-        description="获取交易期间的K线数据和市场快照，用于复盘分析",
+        description="【暂不可用】交易复盘市场快照：底层统一K线数据接口尚未实现，当前恒返回 success=False；请勿依赖本工具获取K线/技术指标数据",
         category=ToolCategory.TRADE_REVIEW,
         data_source="multiple",
         is_online=True,

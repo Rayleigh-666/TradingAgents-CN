@@ -69,10 +69,56 @@ export const toApiMarketType = (market: any): 'cn' | 'hk' | 'us' => {
   return 'cn'
 }
 
+/**
+ * 判断字符串是否「看起来像」一个可识别的证券代码。
+ *
+ * 仅用于通用研究场景：用户填的是自由文本分析目标（如「A股市场当日盘面复盘」），
+ * 只有看起来像真实代码时才允许把它复用为 ticker，避免自由文本污染下游 symbol。
+ *
+ * 命中：A股 6 位数字（600519 / 000001）、带后缀（600519.SH / 000001.SZ / 600519.SS /
+ * 830799.BJ）、港股（00700.HK 或 4-5 位数字 00700 / 9988）、美股字母代码（AAPL / BRK.B）。
+ * 排除：含中文/空白或过长的自由文本。
+ */
+export function looksLikeInstrumentCode(input: string): boolean {
+  const s = String(input ?? '').trim()
+  if (!s) return false
+  // 含非 ASCII（中文等）或空白 → 一定是自由文本
+  if (/[^\x00-\x7F]/.test(s)) return false
+  if (/\s/.test(s)) return false
+
+  const upper = s.toUpperCase()
+
+  // A股：6 位数字，或带沪深/北交所后缀
+  if (/^\d{6}$/.test(upper)) return true
+  if (/^\d{6}\.(SH|SZ|SS|BJ|XSHG|XSHE)$/.test(upper)) return true
+
+  // 港股：1-5 位数字.HK，或纯 4-5 位数字
+  if (/^\d{1,5}\.HK$/.test(upper)) return true
+
+  // ⚠️ 已知误报边界（有意保留，不修）：
+  //   · 纯 4-5 位数字 → "2024" 这类年份/编号会被误判成港股；
+  //   · 1-5 位纯字母   → "GOLD" 这类英文词会被误判成美股。
+  //   仍接受，是因为本函数只回答「要不要把分析目标复用为 ticker」：它宁可**漏判**
+  //   （把真代码拒掉、退化为自由文本）也不愿把自由文本放行成代码；且真正定市场/定代码
+  //   的是后端 app/core/market_codes.resolve_instrument（二次形态校验 + 归一化）。
+  if (/^\d{4,5}$/.test(upper)) return true
+
+  // 美股：1-5 位字母，可带股份类别（BRK.B / BRK-B）
+  if (/^[A-Z]{1,5}$/.test(upper)) return true
+  if (/^[A-Z]{1,5}[.\-][A-Z]$/.test(upper)) return true
+
+  // 跨端一致性：后端 app/core/market_codes.looks_like_instrument_code 与本函数
+  // **故意在 1-3 位纯数字上有别** —— 后端接受 \d{1,5}（铁律：纯数字 ≤5 位 → 港股，
+  // "700" 是最常见的腾讯写法），前端为「宁缺勿滥」只接受 4-5 位。
+  // 改动任一侧请同步另一侧的注释。
+  return false
+}
+
 export default {
   normalizeMarketForAnalysis,
   exchangeCodeToMarket,
   getMarketByStockCode,
-  toApiMarketType
+  toApiMarketType,
+  looksLikeInstrumentCode
 }
 

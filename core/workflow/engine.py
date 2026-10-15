@@ -368,6 +368,13 @@ class WorkflowEngine:
             # State 会丢弃未声明键，导致 agents 拿不到持仓数据并报 "Missing required parameters: ticker"
             "position_info": FieldType.OBJECT,
             "portfolio_data": FieldType.OBJECT,
+            # 组合级研究工作流输入：holdings/total_position_pct/risk_preference/benchmark
+            # 若不声明，LangGraph 动态 State 会丢弃未声明键，组合分析师将拿不到持仓明细。
+            # 这四个键正是 general_portfolio_health_check 的 input_config.fields。
+            "holdings": FieldType.STRING,
+            "total_position_pct": FieldType.NUMBER,
+            "risk_preference": FieldType.STRING,
+            "benchmark": FieldType.STRING,
             "position_type": FieldType.STRING,
             "analysis_params": FieldType.OBJECT,
             "stock_analysis_report": FieldType.OBJECT,

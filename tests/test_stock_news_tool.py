@@ -637,3 +637,21 @@ def test_headlines_tool_deprioritizes_macro_reminder_detail_recommendation(monke
     )
 
     assert "明细建议: 可暂不展开（更像宏观提醒或多公司枚举新闻）" in result
+
+
+def test_low_digit_hk_code_goes_hk_chain_not_empty(monkeypatch):
+    """P2-3：旧版 ``get_stock_news_unified`` 对 "700" 必须走港股链路。
+
+    修复前 ``StockUtils.get_market_info("700")`` 判为 UNKNOWN，is_china/is_hk/is_us
+    全 False，函数直接报「当前未获取到可用新闻数据」。改走 ``resolve_instrument``
+    后与 ``_build_stock_news_bundle`` 同源："700" → 港股（内部 00700）链路。
+    """
+    from core.tools.implementations.news import stock_news as module
+    import tradingagents.dataflows.interface as interface_module
+
+    monkeypatch.setattr(interface_module, "get_google_news", lambda query, date: "[STUB] 港股新闻")
+
+    result = module.get_stock_news_unified.invoke({"ticker": "700", "curr_date": "2026-04-13"})
+
+    assert "港股" in result
+    assert "当前未获取到可用新闻数据" not in result

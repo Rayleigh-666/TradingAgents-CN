@@ -652,7 +652,7 @@ async def get_task_status_new(
 
                     # 🔑 关键：使用任务创建时预估的总时长（固定值），而不是根据进度动态计算
                     # 获取分析师列表和研究深度
-                    analysts = task_params.get("selected_analysts", [])
+                    analysts = task_params.get("selected_analysts") or []
                     research_depth = task_params.get("research_depth", "快速")
                     llm_model = task_params.get("quick_analysis_model", "dashscope")
                     llm_provider = llm_model.split("-")[0] if llm_model else "dashscope"
@@ -996,7 +996,7 @@ async def get_task_result(
                     "key_points": result.get("key_points", []),
                     "execution_time": execution_time,
                     "tokens_used": result.get("tokens_used", 0),
-                    "analysts": task_params.get("selected_analysts", []),
+                    "analysts": task_params.get("selected_analysts") or [],
                     "research_depth": task_params.get("research_depth", "快速"),
                     "reports": result.get("reports", {}),
                     "created_at": unified_task.get("created_at"),
@@ -1483,10 +1483,15 @@ async def get_task_result(
             logger.info(f"🔍 [FINAL] decision内容: {result_data['decision']}")
 
         # 构建严格验证的结果数据（基础字段，必须返回）
+        # ⚠️ stock_symbol / stock_code 是「标的」字段，不再兜底成字面量 "UNKNOWN"：
+        #    通用研究工作流（task_category=general）本就没有个股标的，上游刻意不写
+        #    symbol/stock_code（见 app/routers/workflows.py::_resolve_market_and_symbol），
+        #    若在此兜底成 "UNKNOWN"，前端与报告导出会把 "UNKNOWN" 当成真实标的展示。
+        #    改为空串，让消费方按「无标的」处理（分析目标另有 analysis_target 字段承载）。
         final_result_data = {
             "analysis_id": safe_string(result_data.get("analysis_id"), "unknown"),
-            "stock_symbol": safe_string(result_data.get("stock_symbol"), "UNKNOWN"),
-            "stock_code": safe_string(result_data.get("stock_code"), "UNKNOWN"),
+            "stock_symbol": safe_string(result_data.get("stock_symbol"), ""),
+            "stock_code": safe_string(result_data.get("stock_code"), ""),
             "analysis_date": safe_string(result_data.get("analysis_date"), "2025-08-20"),
             "source": safe_string(result_data.get("source"), "unknown"),
             "summary": safe_string(result_data.get("summary"), "分析摘要暂无"),

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @register_tool(
     tool_id="get_market_snapshot_for_review",
     name="获取市场快照",
-    description="获取交易期间K线数据和市场快照用于复盘分析，返回K线序列、成交量、技术指标和期间市场环境标签等结构化数据",
+    description="【暂不可用】交易复盘市场快照：底层统一K线数据接口尚未实现，当前恒返回 success=False；请勿依赖本工具获取K线/技术指标数据",
     category="trade_review",
     is_online=True,
     data_source_handling="self_contained",
@@ -41,56 +41,16 @@ def get_market_snapshot_for_review(
     Returns:
         包含K线数据的字典
     """
-    try:
-        from tradingagents.dataflows.interface import get_stock_data_unified
-        from datetime import datetime, timedelta
-        import asyncio
-
-        if not start_date or not end_date:
-            # 默认获取最近3个月的数据
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-
-        # 扩展日期范围（前后各10天）
-        query_start = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
-        query_end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=10)).strftime("%Y-%m-%d")
-
-        async def _fetch_kline():
-            # 获取K线数据
-            return await get_stock_data_unified(
-                ticker=code,
-                start_date=query_start,
-                end_date=query_end,
-                market_type=market.lower()
-            )
-
-        # 在同步上下文中运行异步代码
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        kline_data = loop.run_until_complete(_fetch_kline())
-
-        logger.info(f"✅ 获取市场快照成功: {code}, {len(kline_data) if isinstance(kline_data, list) else 'N/A'} 条K线")
-
-        return {
-            "success": True,
-            "data": {
-                "code": code,
-                "market": market,
-                "start_date": start_date,
-                "end_date": end_date,
-                "kline_data": kline_data
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"❌ 获取市场快照失败: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "data": None
-        }
+    # 历史遗留说明（stale import 清理）：
+    # 原实现依赖 `from tradingagents.dataflows.interface import get_stock_data_unified`，
+    # 但该符号在整个代码库中从未存在（interface 仅提供同步的 get_china_stock_data_unified /
+    # get_hk_stock_data_unified / get_stock_data_by_market，均返回格式化字符串而非 K 线列表，
+    # 且不存在对应的异步统一接口）。这使本工具历史上恒返回 success=False，属静默失效的死路。
+    # 由于没有可直接替换、且能被验证的统一异步 K 线接口，此处移除该死 import 与死 K 线分支；
+    # 如需该能力需另行实现数据获取（可参考 app/services/trade_review_service.py 的 _fetch_kline_unified）。
+    return {
+        "success": False,
+        "error": "市场快照暂不可用：底层统一K线数据接口尚未实现",
+        "data": None,
+    }
 

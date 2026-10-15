@@ -723,10 +723,16 @@ async def _execute_general_workflow_slot(
         )
         input_config = wf_doc.get("input_config") if wf_doc else None
 
-        # 构建任务参数：分析目标作为 ticker，合并 custom_params
+        # 构建任务参数：分析目标原样带入，合并 custom_params。
+        #
+        # ⚠️ 契约：通用研究工作流**绝不写 symbol / stock_code**。
+        # analysis_target 是自由文本（「新能源板块」「持仓组合健康度体检」等），
+        # 写进 symbol 会被后续链路当成真实证券代码去查库，污染分析结果；
+        # 真正的「识别到代码才写 symbol」由 `workflows.py::_resolve_market_and_symbol`
+        # 统一负责（它走 resolve_instrument 做形态判断 + 归一化）。
+        # 这里只提供 analysis_target，由下游按需取用。
         task_params = {
-            "symbol": analysis_target,
-            "stock_code": analysis_target,
+            "analysis_target": analysis_target,
             "analysis_date": analysis_date,
             "task_category": "general",  # 🆕 标记为通用研究任务
             **custom_params,  # 合并自定义参数

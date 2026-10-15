@@ -18,6 +18,14 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+# 「0」是合法业务取值、且需要与「未提供」区分的数值字段。
+# 这类字段默认会被生成为 Annotated[float, keep_non_empty]，而 LangGraph 会把
+# 从未赋值的 float 通道物化为类型零值 0.0，导致「未填写」在报告里被误显示为
+# 「0%」，与用户真的填了 0 无法区分。改用 Annotated[Any, keep_number]：
+# 缺省保持 None（消费方如实省略），显式 0 得以保留。
+_NUMBER_KEEP_ZERO_FIELDS = frozenset({"total_position_pct"})
+
+
 class StateSchemaBuilder:
     """
     状态 Schema 构建器
@@ -235,7 +243,7 @@ class StateSchemaBuilder:
         from typing import TypedDict, Annotated, List
         import operator
         from langgraph.graph.message import add_messages
-        from .reducers import keep_non_empty, merge_dict, keep_latest_list
+        from .reducers import keep_non_empty, merge_dict, keep_latest_list, keep_number
 
         # 动态创建字段（全部带 reducer 注解）
         annotations = {}
@@ -245,6 +253,9 @@ class StateSchemaBuilder:
                 annotations[name] = Annotated[Any, keep_non_empty]
             elif name.startswith("_debate_") and name.endswith("_count"):
                 annotations[name] = Annotated[int, operator.add]
+            elif name in _NUMBER_KEEP_ZERO_FIELDS:
+                # 数值字段中 0 为合法取值范围：缺省保持 None，保留显式 0（见常量注释）
+                annotations[name] = Annotated[Any, keep_number]
             elif field.type == FieldType.LIST_MESSAGES:
                 annotations[name] = Annotated[List[BaseMessage], add_messages]
             elif field.type == FieldType.STRING:

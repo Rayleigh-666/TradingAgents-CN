@@ -6,7 +6,7 @@
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import logging
 
@@ -26,6 +26,98 @@ router = APIRouter(
     prefix="/api/workflows",
     tags=["workflows"]
 )
+
+
+# ==================== 市场 / 代码解析 ====================
+
+def _normalize_market_type(value: Any) -> Optional[str]:
+    """把各种 market_type 写法归一化为 cn/hk/us；无法识别返回 None。
+
+    复用 app.core.market_codes 的**唯一**别名表（本文件不再自带一份，避免漂移：
+    历史上 workflows.py 与 stock_sentiment.py 各写一份，同一输入命中结果不同）。
+    """
+    from app.core.market_codes import try_resolve_market
+
+    return try_resolve_market(value) or None
+
+
+# 客户端**不得**通过 custom_params 覆盖服务端解析/标记出来的保留键，否则会架空参数契约：
+#   market_type   —— 传 "a_share"/"xxx" 会把已归一化的 cn/hk/us 原样盖回，落库非法市场
+#   symbol / stock_code —— 传自由文本即可绕过「真识别才写 symbol」守卫，污染下游
+#   task_category —— 非 general 流程传 "general" 即可命中 registry 的 symbol 豁免判据
+_RESERVED_TASK_PARAM_KEYS = frozenset({"market_type", "symbol", "stock_code", "task_category"})
+
+
+def _sanitize_custom_params(
+    custom_params: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """过滤 custom_params：丢弃值为 None 的键与保留键。
+
+    - 丢弃 None：key 存在但值为 None 会覆盖上游默认值，并可能绕过「有值才写」守卫，
+      导致下游 len(None) 崩溃（历史 500 的根因）。
+    - 丢弃保留键：见 _RESERVED_TASK_PARAM_KEYS 注释。
+
+    Returns:
+        (可安全合并进 task_params 的字典, 被丢弃的保留键名列表（已排序，仅用于日志）)
+    """
+    if not custom_params:
+        return {}, []
+
+    clean: Dict[str, Any] = {}
+    dropped_reserved: List[str] = []
+    for key, value in custom_params.items():
+        if value is None:
+            continue
+        if key in _RESERVED_TASK_PARAM_KEYS:
+            dropped_reserved.append(key)
+            continue
+        clean[key] = value
+    return clean, sorted(dropped_reserved)
+
+
+def _resolve_market_and_symbol(
+    ticker: Optional[str],
+    custom_params: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[str]]:
+    """解析出 (market_type, symbol)。
+
+    语义（按优先级）：
+
+    1. 先对 ``ticker`` 做「像不像证券代码」的形态判断（``resolve_instrument``）：
+       - 识别到代码 → 以**识别结果**为准定 market，并返回**归一化后**的内部 symbol
+         （``"0700.HK"`` → ``("hk", "00700")``、``"600519.SS"`` → ``("cn", "600519")``、
+         ``"aapl"`` → ``("us", "AAPL")``、``"700"`` → ``("hk", "00700")``）。
+       - 不像代码 / 为空（自由文本，如「A股市场当日盘面复盘」）→ 不写 symbol，
+         market 取显式 ``custom_params.market_type``，缺省 ``"cn"``。
+    2. ``symbol`` 命中时若与显式 ``market_type`` 冲突（P2-2），**以识别结果为准**并打
+       warning：symbol 是具体标的，跨市场落库会让下游用错市场的 provider 查数据。
+
+    特别注意：**不能**直接对 ``ticker`` 调 ``guess_market`` —— 它「含字母 → us」的规则
+    会把「A股市场当日盘面复盘」这类含拉丁字母的自由文本判成美股，故必须先过
+    ``resolve_instrument``（其内部先做 ``looks_like_instrument_code`` 形态判断）。
+
+    注意：调用方在 ``custom_params`` 合并进 ``task_params`` **之前** 调用本函数，因此
+    这里必须直接读取传入的 ``custom_params``，而不能依赖 task_params。
+    """
+    from app.core.market_codes import resolve_instrument
+
+    custom_params = custom_params or {}
+    explicit_market = _normalize_market_type(custom_params.get("market_type")) or None
+
+    recognized_market, symbol = resolve_instrument(ticker or "")
+    symbol = symbol or None
+
+    if symbol:
+        if explicit_market and explicit_market != recognized_market:
+            logger.warning(
+                f"⚠️ [工作流执行] market_type 与代码识别结果冲突："
+                f"显式={explicit_market!r} 识别={recognized_market!r} ticker={ticker!r}；"
+                f"以识别结果为准（避免跨市场落库）"
+            )
+        return recognized_market, symbol
+
+    # 不像代码（自由文本/空）→ 不写 symbol，市场取显式值，缺省 cn
+    return (explicit_market or "cn"), None
 
 
 # ==================== 数据模型 ====================
@@ -298,20 +390,23 @@ async def execute_workflow(
         # 准备任务参数
         task_params = {}
 
-        # ticker 相关参数（仅当提供了 ticker 时才设置）
-        if data.ticker:
-            market = StockUtils.identify_stock_market(data.ticker)
-            market_type_mapping = {
-                StockMarket.CHINA_A: "cn",
-                StockMarket.HONG_KONG: "hk",
-                StockMarket.US: "us",
-                StockMarket.UNKNOWN: "cn"
-            }
-            market_type = market_type_mapping.get(market, "cn")
-            task_params["symbol"] = data.ticker
-            task_params["stock_code"] = data.ticker
-            task_params["market_type"] = market_type
-            logger.info(f"📊 [工作流执行] 股票 {data.ticker} 识别为市场: {market_type}")
+        # ticker 与 market_type 解析
+        # - general 场景 ticker 是自由文本（如「A股市场当日盘面复盘」），既不能当股票代码，
+        #   更不能写进 symbol/stock_code 污染下游（报告标题、导出文件名等）。
+        # - market_type 恒有值且必为 cn/hk/us；symbol/stock_code 仅在真正识别到代码时才写。
+        # 注意：此处早于 custom_params 合并，故直接读 data.custom_params。
+        market_type, resolved_symbol = _resolve_market_and_symbol(
+            data.ticker, data.custom_params
+        )
+        if resolved_symbol:
+            task_params["symbol"] = resolved_symbol
+            task_params["stock_code"] = resolved_symbol
+            logger.info(f"📊 [工作流执行] 股票 {resolved_symbol} 识别为市场: {market_type}")
+        else:
+            logger.info(
+                f"📊 [工作流执行] 未识别到个股代码（ticker={data.ticker!r}），按市场 {market_type} 处理"
+            )
+        task_params["market_type"] = market_type
 
         # 通用参数
         task_params["analysis_date"] = data.analysis_date.strftime("%Y-%m-%d") if data.analysis_date else None
@@ -320,7 +415,8 @@ async def execute_workflow(
         task_params["deep_analysis_model"] = data.deep_analysis_model
         task_params["lookback_days"] = data.lookback_days
         task_params["max_debate_rounds"] = data.max_debate_rounds
-        task_params["selected_analysts"] = data.selected_analysts if hasattr(data, 'selected_analysts') else None
+        if data.selected_analysts:
+            task_params["selected_analysts"] = data.selected_analysts
 
         # 🆕 根据 input_config.fields 的 default 值补充缺失参数
         if input_config and isinstance(input_config, dict):
@@ -334,8 +430,14 @@ async def execute_workflow(
                         logger.debug(f"📋 [工作流执行] 从 input_config 补充参数: {fname}={default_val}")
 
         # 🆕 合并自定义参数（通用研究等场景使用）
-        if data.custom_params:
-            task_params.update(data.custom_params)
+        # 注意：丢弃值为 None 的键与保留键（见 _sanitize_custom_params）。
+        # 否则 custom_params 里的 None 会覆盖上面的默认值，并可能绕过 selected_analysts
+        # 的「有值才写」守卫（下游 len(None) 崩溃）；保留键被原值回盖还会架空参数契约。
+        _clean_custom, _dropped_reserved = _sanitize_custom_params(data.custom_params)
+        if _dropped_reserved:
+            logger.warning(f"⚠️ [工作流执行] custom_params 中的保留键已被服务端忽略: {_dropped_reserved}")
+        if _clean_custom:
+            task_params.update(_clean_custom)
 
         # 🆕 为 general 类型工作流打上 task_category 标记，便于后续查询
         if workflow_type == "general":

@@ -57,7 +57,6 @@ try:
         get_trade_records as tool_get_trade_records,
         build_trade_info as tool_build_trade_info,
         get_account_info as tool_get_account_info,
-        get_market_snapshot_for_review as tool_get_market_snapshot
     )
     TOOLS_AVAILABLE = True
 except ImportError:

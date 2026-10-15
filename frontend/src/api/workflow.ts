@@ -201,7 +201,9 @@ export const workflowApi = {
     } as any)
     // 从 ApiResponse 中提取实际的执行结果
     if (res.success && res.data) {
-      return res.data
+      // 后端 data 载荷是 {task_id, status, message}，不含 success 字段，
+      // 这里补上以满足 ExecutionResult 契约（否则调用方读 result.success 恒为 undefined）
+      return { ...res.data, success: true }
     }
     // 如果外层失败，构造一个失败的 ExecutionResult
     return {

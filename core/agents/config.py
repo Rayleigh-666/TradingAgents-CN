@@ -501,8 +501,7 @@ BUILTIN_AGENTS: Dict[str, AgentMetadata] = {
             "get_stock_market_data_unified",
             "get_stockstats_indicators_report",
             "get_trade_records",
-            "build_trade_info",
-            "get_market_snapshot_for_review"
+            "build_trade_info"
         ],
         default_tools=[
             "get_stock_market_data_unified",
@@ -529,8 +528,7 @@ BUILTIN_AGENTS: Dict[str, AgentMetadata] = {
             "get_stock_market_data_unified",
             "get_trade_records",
             "build_trade_info",
-            "get_account_info",
-            "get_market_snapshot_for_review"
+            "get_account_info"
         ],
         default_tools=[
             "build_trade_info",
@@ -585,8 +583,7 @@ BUILTIN_AGENTS: Dict[str, AgentMetadata] = {
             "get_stock_market_data_unified",
             "get_china_market_overview",
             "get_trade_records",
-            "build_trade_info",
-            "get_market_snapshot_for_review"
+            "build_trade_info"
         ],
         default_tools=[
             "get_stock_market_data_unified",
@@ -612,8 +609,7 @@ BUILTIN_AGENTS: Dict[str, AgentMetadata] = {
         tools=[
             "get_trade_records",
             "build_trade_info",
-            "get_account_info",
-            "get_market_snapshot_for_review"
+            "get_account_info"
         ],
         default_tools=[
             "build_trade_info",

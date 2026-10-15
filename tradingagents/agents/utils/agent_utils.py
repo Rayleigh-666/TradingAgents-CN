@@ -1,6 +1,7 @@
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, AIMessage
 from typing import List
 from typing import Annotated
+from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import RemoveMessage
 from langchain_core.tools import tool
@@ -21,6 +22,55 @@ from tradingagents.utils.tool_logging import log_tool_call, log_analysis_step
 # 导入日志模块
 from tradingagents.utils.logging_manager import get_logger
 logger = get_logger('agents')
+
+
+def check_local_reddit_cache(data_dir: Optional[str] = None) -> tuple:
+    """判断本地 Reddit 缓存是否可用 —— 美股情绪维度的**唯一**可用性门槛。
+
+    数据源真相（本函数存在的理由）：美股情绪走的 ``get_reddit_company_news`` /
+    ``get_reddit_global_news``（``tradingagents/dataflows/interface.py``）最终调用
+    ``tradingagents/dataflows/news/reddit.py::fetch_top_from_category``，
+    **读的是本地缓存目录** ``<data_dir>/reddit_data/<category>/*.jsonl``：
+    不发网络请求，也**不读** ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET``。
+    因此本维度是否可用只取决于「本地缓存里有没有 ``.jsonl``」。历史实现按
+    ``REDDIT_*`` 凭证判断是**错的门槛**：有凭证但缓存为空时照样空转，
+    而缓存存在却没配凭证时反而被判「不可用」。
+
+    路径推导与 ``interface.py`` **同源**：直接复用它的模块级常量 ``DATA_DIR``
+    （即 ``DATA_DIR = config_manager.get_data_dir()``，import 时求值一次），
+    再拼 ``reddit_data``（对应 ``interface.py`` 的
+    ``os.path.join(DATA_DIR, "reddit_data")``），不另写一套路径规则、也不另取一次配置。
+    若这里改为每次调用重新执行 ``config_manager.get_data_dir()``，运行期 ``set_data_dir``
+    一旦改过配置，本门控就会与数据源实际读取的目录不一致，从而误判缓存可用性。
+
+    Args:
+        data_dir: 显式指定数据目录（测试用）；为 None 时读 ``interface.DATA_DIR``。
+
+    Returns:
+        ``(available, reason)``：可用时 ``(True, "")``；不可用时 ``(False, <原因>)``，
+        原因用于下游输出「数据源不可用」的显式降级说明。
+    """
+    try:
+        if data_dir is None:
+            data_dir = interface.DATA_DIR
+    except Exception as e:  # 路径推导失败 → 按不可用处理，并说明原因
+        return False, f"无法解析数据目录: {e}"
+
+    if not data_dir:
+        return False, "数据目录未配置"
+
+    reddit_dir = os.path.join(data_dir, "reddit_data")
+    if not os.path.isdir(reddit_dir):
+        return False, f"本地 Reddit 缓存目录不存在: {reddit_dir}"
+
+    try:
+        for _root, _dirs, files in os.walk(reddit_dir):
+            if any(name.endswith(".jsonl") for name in files):
+                return True, ""
+    except Exception as e:
+        return False, f"读取本地 Reddit 缓存失败: {e}"
+
+    return False, f"本地 Reddit 缓存为空（无 .jsonl）: {reddit_dir}"
 
 
 def create_msg_delete():
@@ -208,16 +258,13 @@ class Toolkit:
         Returns:
             str: 包含主要指数实时行情的市场概览报告
         """
-        try:
-            # 使用Tushare获取主要指数数据
-            from tradingagents.dataflows.providers.china.tushare import get_tushare_adapter
-
-            adapter = get_tushare_adapter()
-
-
-            # 使用Tushare获取主要指数信息
-            # 这里可以扩展为获取具体的指数数据
-            return f"""# 中国股市概览 - {curr_date}
+        # 历史遗留说明（stale import 清理）：
+        # 原实现 try 内 `from tradingagents.dataflows.providers.china.tushare import
+        # get_tushare_adapter` 引用了并不存在的符号（该模块只提供 TushareProvider /
+        # get_tushare_provider），其结果 `adapter` 从未被使用，属纯死代码；它还使函数恒走
+        # except 返回「获取失败」。Tushare 指数实时行情能力尚未实现，故移除该死 import 与
+        # 随之恒死的 try/except，直接返回「即将推出」占位说明；如需该能力需另行实现。
+        return f"""# 中国股市概览 - {curr_date}
 
 ## 📊 主要指数
 - 上证指数: 数据获取中...
@@ -232,9 +279,6 @@ class Toolkit:
 数据来源: Tushare专业数据源
 更新时间: {curr_date}
 """
-
-        except Exception as e:
-            return f"中国市场概览获取失败: {str(e)}。正在从TDX迁移到Tushare数据源。"
 
     @staticmethod
     @tool
@@ -1349,89 +1393,23 @@ class Toolkit:
         ticker: Annotated[str, "股票代码（支持A股、港股、美股）"],
         curr_date: Annotated[str, "当前日期，格式：YYYY-MM-DD"]
     ) -> str:
+        """统一股票情绪工具的 legacy Toolkit 桥接。
+
+        仅委托给 ``core.tools.implementations.social.stock_sentiment`` 的**唯一**实现，
+        不再在本文件维护第二套「市场分派 + Reddit 可用性门控 + 免责文案」——
+        两套逻辑会持续漂移（同为 Toolkit 方法的 news 标题/明细工具此前已按同样方式桥接）。
         """
-        统一的股票情绪分析工具
-        自动识别股票类型（A股、港股、美股）并调用相应的情绪数据源
-
-        Args:
-            ticker: 股票代码（如：000001、0700.HK、AAPL）
-            curr_date: 当前日期（格式：YYYY-MM-DD）
-
-        Returns:
-            str: 情绪分析报告
-        """
-        logger.info(f"😊 [统一情绪工具] 分析股票: {ticker}")
-
         try:
-            from tradingagents.utils.stock_utils import StockUtils
+            from core.tools.implementations.social.stock_sentiment import (
+                get_stock_sentiment_unified as core_sentiment_tool,
+            )
 
-            # 自动识别股票类型
-            market_info = StockUtils.get_market_info(ticker)
-            is_china = market_info['is_china']
-            is_hk = market_info['is_hk']
-            is_us = market_info['is_us']
-
-            logger.info(f"😊 [统一情绪工具] 股票类型: {market_info['market_name']}")
-
-            result_data = []
-
-            if is_china or is_hk:
-                # 中国A股和港股：使用社交媒体情绪分析
-                logger.info(f"🇨🇳🇭🇰 [统一情绪工具] 处理中文市场情绪...")
-
-                try:
-                    # 可以集成微博、雪球、东方财富等中文社交媒体情绪
-                    # 目前使用基础的情绪分析
-                    sentiment_summary = f"""
-## 中文市场情绪分析
-
-**股票**: {ticker} ({market_info['market_name']})
-**分析日期**: {curr_date}
-
-### 市场情绪概况
-- 由于中文社交媒体情绪数据源暂未完全集成，当前提供基础分析
-- 建议关注雪球、东方财富、同花顺等平台的讨论热度
-- 港股市场还需关注香港本地财经媒体情绪
-
-### 情绪指标
-- 整体情绪: 中性
-- 讨论热度: 待分析
-- 投资者信心: 待评估
-
-*注：完整的中文社交媒体情绪分析功能正在开发中*
-"""
-                    result_data.append(sentiment_summary)
-                except Exception as e:
-                    result_data.append(f"## 中文市场情绪\n获取失败: {e}")
-
-            else:
-                # 美股：使用Reddit情绪分析
-                logger.info(f"🇺🇸 [统一情绪工具] 处理美股情绪...")
-
-                try:
-                    from tradingagents.dataflows.interface import get_reddit_sentiment
-
-                    sentiment_data = get_reddit_sentiment(ticker, curr_date)
-                    result_data.append(f"## 美股Reddit情绪\n{sentiment_data}")
-                except Exception as e:
-                    result_data.append(f"## 美股Reddit情绪\n获取失败: {e}")
-
-            # 组合所有数据
-            combined_result = f"""# {ticker} 情绪分析
-
-**股票类型**: {market_info['market_name']}
-**分析日期**: {curr_date}
-
-{chr(10).join(result_data)}
-
----
-*数据来源: 根据股票类型自动选择最适合的情绪数据源*
-"""
-
-            logger.info(f"😊 [统一情绪工具] 数据获取完成，总长度: {len(combined_result)}")
-            return combined_result
-
+            if hasattr(core_sentiment_tool, "invoke"):
+                return core_sentiment_tool.invoke(
+                    {"ticker": ticker, "curr_date": curr_date}
+                )
+            return core_sentiment_tool(ticker=ticker, curr_date=curr_date)
         except Exception as e:
             error_msg = f"统一情绪分析工具执行失败: {str(e)}"
-            logger.error(f"❌ [统一情绪工具] {error_msg}")
+            logger.error(f"❌ [统一情绪工具/Toolkit桥接] {error_msg}")
             return error_msg

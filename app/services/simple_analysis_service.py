@@ -578,6 +578,31 @@ def _load_model_config_from_db(model_name: str) -> dict:
         return {}
 
 
+def _resolve_selected_analysts(parameters) -> list:
+    """从请求参数里解析 ``selected_analysts``，做**真正的** None/空兜底。
+
+    历史 bug：原写法 ``request.parameters.selected_analysts if request.parameters else [...]``
+    只在 ``parameters`` 为假时兜底，一旦 ``parameters`` 存在但 ``selected_analysts`` 为
+    ``None``，就会把 ``None`` 原样带下去：
+      - 传给 ``create_analysis_config`` 会写进 ``config["selected_analysts"] = None``；
+      - 在 ``simulate_progress`` 线程里 ``enumerate(None)`` 直接抛 ``TypeError``。
+
+    兜底口径：``None`` 与**空列表**都视为「未选择」，回落到 ``["market", "fundamentals"]``。
+    依据是同文件既有用法与默认值都采用这一口径：
+      - :1250 ``analysts=request.parameters.selected_analysts or ["market", "fundamentals"]``
+      - :946  ``config.get("selected_analysts", ["market", "fundamentals"])``
+    即「空列表 = 没有分析师」在项目里会被回落成默认两组，而不是「真的一个都不跑」。
+
+    Args:
+        parameters: 请求参数对象（可能为 None），取其 ``selected_analysts`` 属性。
+
+    Returns:
+        归一化后的分析师列表；输入缺失/为 None/为空时返回默认 ``["market", "fundamentals"]``。
+    """
+    analysts = getattr(parameters, "selected_analysts", None)
+    return analysts or ["market", "fundamentals"]
+
+
 def create_analysis_config(
     research_depth,  # 支持数字(1-5)或字符串("快速", "标准", "深度")
     selected_analysts: list,
@@ -1682,7 +1707,7 @@ class SimpleAnalysisService:
             # 创建分析配置（支持混合模式）
             config = create_analysis_config(
                 research_depth=research_depth,
-                selected_analysts=request.parameters.selected_analysts if request.parameters else ["market", "fundamentals"],
+                selected_analysts=_resolve_selected_analysts(request.parameters),
                 quick_model=quick_model,
                 deep_model=deep_model,
                 llm_provider=quick_provider,  # 主要使用快速模型的供应商
@@ -1752,7 +1777,7 @@ class SimpleAnalysisService:
                         return
 
                     # 分析师阶段 - 根据选择的分析师数量动态调整
-                    analysts = request.parameters.selected_analysts if request.parameters else ["market", "fundamentals"]
+                    analysts = _resolve_selected_analysts(request.parameters)
 
                     # 模拟分析师执行
                     for i, analyst in enumerate(analysts):

@@ -6,7 +6,6 @@
 
 import os
 import time
-import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -2128,21 +2127,26 @@ class OptimizedChinaDataProvider:
         return None
 
     def _generate_fallback_data(self, symbol: str, start_date: str, end_date: str, error_msg: str) -> str:
-        """生成备用数据"""
+        """生成备用数据。
+
+        ⚠️ 本函数**不得**编造任何行情数值。返回值会被原样塞进 agent 的 prompt，
+        LLM 无法区分「带标签的假数字」和「真实数据」。历史实现用 random.uniform()
+        编造价格与涨跌幅，只靠一行「模拟数据（仅供演示）」标签兜底 ——
+        标签守不住就等于数据造假。这里改为**显式不可用声明**，并显式禁止下游推断。
+        """
         return f"""# {symbol} A股数据获取失败
 
 ## ❌ 错误信息
 {error_msg}
 
-## 📊 模拟数据（仅供演示）
+## ⛔ 本维度数据不可用
 - 股票代码: {symbol}
-- 股票名称: 模拟公司
 - 数据期间: {start_date} 至 {end_date}
-- 模拟价格: ¥{random.uniform(10, 50):.2f}
-- 模拟涨跌: {random.uniform(-5, 5):+.2f}%
+- 状态: 未获取到任何真实行情数据
 
 ## ⚠️ 重要提示
 由于数据接口限制或网络问题，无法获取实时数据。
+**请勿基于本段落推断该标的的价格、涨跌幅或任何行情结论。**
 建议稍后重试或检查网络连接。
 
 生成时间: {datetime.now(ZoneInfo(get_timezone_name())).strftime('%Y-%m-%d %H:%M:%S')}

@@ -19,6 +19,66 @@ from core.workflow.default_workflow_provider import get_default_workflow_provide
 
 logger = logging.getLogger(__name__)
 
+# 通用研究工作流在缺分析目标文本时使用的占位 ticker（仅引擎入参，不进 symbol）。
+#
+# ⚠️ 这是一个**引擎内部占位串，不是证券代码**：既不能拿去查行情，也不能拿去查库。
+#    任何「把 ticker 解析为市场」的调用方**必须**走
+#    ``app.core.market_codes.resolve_instrument`` —— 它对 ``"__GENERAL__"`` 返回
+#    ``("", "")``，调用方据此按「没有标的」处理。
+#    **不要**直接调用 ``app.core.market_codes.guess_market``：它的规则是「含字母 → us」，
+#    会把任何含字母的串（本哨兵、以及含拉丁字母的自由文本分析目标）一律判成美股。
+#
+#    澄清一个错误归因：曾有报告称原值 ``"MARKET"`` 会命中美股代码正则
+#    ``^[A-Z]{1,5}$``。这是错的 —— ``"MARKET"`` 有 6 个字母，1-5 位正则压根不匹配，
+#    ``StockUtils.identify_stock_market("MARKET")`` 实测返回 ``UNKNOWN``。
+#    真正的问题出在 ``guess_market`` 的「含字母 → us」规则上。也正因为如此，
+#    把哨兵换成同样含字母的 ``"__GENERAL__"`` **并不能**靠「避开正则」解决；
+#    正解是解析侧一律经 ``resolve_instrument``（形态白名单优先），而不是朴素猜市场。
+GENERAL_TICKER_SENTINEL = "__GENERAL__"
+
+
+def apply_general_ticker_fallback(workflow_inputs: Dict[str, Any]) -> Optional[str]:
+    """通用研究工作流的 ticker 入参兜底（**仅对 general 任务生效**）。
+
+    背景：``task_category == "general"`` 的研究流程没有个股代码，上游
+    ``app/routers/workflows.py::_resolve_market_and_symbol`` 刻意**不**把自由文本写进
+    ``symbol`` / ``stock_code``（否则会污染市场识别、报告标题与导出文件名）。
+    但工作流引擎的 agent 以 ``ticker`` 作为「分析标的」入参（见各 adapter 的
+    ``AgentInput(name="ticker", ...)``），缺失时会直接报
+    ``Missing required parameters: ticker``，导致全部分析维度秒失败、任务「假成功」。
+
+    本函数**只写 workflow_inputs["ticker"]**（引擎内部入参），
+    绝不回写 ``symbol`` / ``stock_code``。
+
+    门控：整个兜底都要求 ``task_category == "general"``（大小写/空白不敏感）。
+    - 非 general 任务（普通股票 / ETF / 持仓 / 复盘）：``ticker`` 为空时**不做任何补齐**，
+      返回 ``None``，让真实的「缺 ticker」配置错误照常暴露 —— 无条件补齐会把它悄悄掩盖。
+    - general 任务：按 ``analysis_target`` > ``analysis_goal`` > ``company_of_interest``
+      > ``GENERAL_TICKER_SENTINEL`` 的优先级补齐。
+
+    Args:
+        workflow_inputs: 工作流输入参数字典（原地修改 ticker）
+
+    Returns:
+        实际写入的 ticker 值；未做任何写入时返回 None。
+    """
+    if workflow_inputs.get("ticker"):
+        return None
+
+    if str(workflow_inputs.get("task_category") or "").strip().lower() != "general":
+        # 非通用研究任务不做任何兜底：真正的缺参会照常报错，不能被掩盖。
+        return None
+
+    target = (
+        workflow_inputs.get("analysis_target")
+        or workflow_inputs.get("analysis_goal")
+        or workflow_inputs.get("company_of_interest")
+    )
+    value = str(target).strip() if target and str(target).strip() else GENERAL_TICKER_SENTINEL
+
+    workflow_inputs["ticker"] = value
+    return value
+
 
 class UnifiedAnalysisEngine:
     """统一分析引擎
@@ -645,15 +705,34 @@ class UnifiedAnalysisEngine:
         except Exception as e:
             self.logger.warning(f"⚠️ 读取 input_config 失败，使用硬编码默认值: {e}")
 
+        # 🆕 通用研究工作流（task_category=general）没有个股代码。
+        # 上游 app/routers/workflows.py::_resolve_market_and_symbol 刻意**不**把自由文本
+        # 写进 symbol / stock_code（否则会污染市场识别、报告标题与导出文件名）。
+        # 但工作流引擎的 agent 以 ticker 作为「分析标的」入参，缺失时会直接报
+        # "Missing required parameters: ticker"，使全部分析维度秒失败、任务假成功。
+        # 兜底实现见 apply_general_ticker_fallback（**只补 ticker 入参**，不回写 symbol）。
+        _filled_ticker = apply_general_ticker_fallback(workflow_inputs)
+        if _filled_ticker:
+            self.logger.info(
+                f"📋 [general] 分析目标 → ticker 入参 = {_filled_ticker!r}"
+                f"（仅引擎入参，不写 symbol/stock_code）"
+            )
+
         # 通用兜底参数（当 input_config 不存在或未定义对应字段时）
         from datetime import datetime
         # 🔑 注意：不能用 setdefault，因为 API 请求可能传入 analysis_date=None，
         # setdefault 不会覆盖已存在但值为 None 的 key，导致下游 Agent 报错
         if not workflow_inputs.get("analysis_date"):
             workflow_inputs["analysis_date"] = datetime.now().strftime("%Y-%m-%d")
-        workflow_inputs.setdefault("research_depth", "标准")
-        workflow_inputs.setdefault("lookback_days", 30)
-        workflow_inputs.setdefault("max_debate_rounds", 3)
+        # 同上：不能用 setdefault —— key 存在但值为 None 时 setdefault 不生效。
+        # research_depth 是字符串，空串等价于「未指定」；两个数字参数用 is None 判断，
+        # 因为 0 可能是合法值（如 lookback_days=0），不能被误替换成默认值。
+        if not workflow_inputs.get("research_depth"):
+            workflow_inputs["research_depth"] = "标准"
+        if workflow_inputs.get("lookback_days") is None:
+            workflow_inputs["lookback_days"] = 30
+        if workflow_inputs.get("max_debate_rounds") is None:
+            workflow_inputs["max_debate_rounds"] = 3
 
         self.logger.info(f"📦 工作流输入参数: ticker={workflow_inputs.get('ticker')}, "
                         f"analysis_date={workflow_inputs.get('analysis_date')}, "

@@ -148,10 +148,30 @@ class AnalysisWorkflowRegistry:
             return False, f"未注册的任务类型: {task_type}"
         
         # 检查必需参数
-        for required_param in config.required_params:
+        #
+        # ⚠️ 通用研究工作流（workflow_type=general）以「分析目标」自由文本驱动，不针对个股，
+        #    因此 task_params 里**没有 symbol**（由 app/routers/workflows.py 的
+        #    _resolve_market_and_symbol 保证：只有真正识别为股票代码时才写 symbol/stock_code）。
+        #    general 复用 STOCK_ANALYSIS 载体（见 workflows.py 的
+        #    WORKFLOW_TYPE_TO_TASK_TYPE），而 STOCK_ANALYSIS 的 required_params 含 symbol，
+        #    若不豁免会把所有通用研究任务卡死在参数校验（报「缺少必需参数: symbol」）。
+        #    豁免依据是 workflows.py 写入的 task_params["task_category"] == "general"，
+        #    而不是「params 里没有 symbol」——后者会让普通股票分析漏校验。
+        #    豁免范围**限定 STOCK_ANALYSIS**：ETF 等其它类型仍必须给 symbol，
+        #    这样若将来有人把 ETF 流程也打上 general 标记，会立刻暴露而不是静默放过。
+        #    market_type 仍然必需：通用流程也必须明确 cn/hk/us。
+        required_params = list(config.required_params)
+        is_general_research = (
+            task_type == AnalysisTaskType.STOCK_ANALYSIS
+            and str(params.get("task_category") or "").strip().lower() == "general"
+        )
+        if is_general_research:
+            required_params = [p for p in required_params if p != "symbol"]
+
+        for required_param in required_params:
             if required_param not in params:
                 return False, f"缺少必需参数: {required_param}"
-        
+
         return True, None
     
     @classmethod

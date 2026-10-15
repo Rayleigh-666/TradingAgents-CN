@@ -2431,7 +2431,7 @@ class WorkflowBuilder:
         重要：必须初始化辩论状态字典，包含 count=0，
         因为研究员智能体期望 state["investment_debate_state"]["count"] 存在
         """
-        participants = node.config.get("participants", [])
+        participants = node.config.get("participants") or []
         rounds = node.config.get("rounds", 1)
         node_id = node.id
         node_label = node.label or node_id
@@ -3014,7 +3014,7 @@ class WorkflowBuilder:
 
         for node in definition.nodes:
             if node.type == NodeType.DEBATE:
-                participants = node.config.get("participants", [])
+                participants = node.config.get("participants") or []
                 rounds_raw = node.config.get("rounds", 1)
 
                 # 处理 rounds 可能是字符串的情况（如 "auto", "1" 等）

@@ -5,6 +5,7 @@
 
 Reducer 规则：
 - keep_non_empty: 字符串/标量字段，保留非空值（新值优先）
+- keep_number: 数值字段，仅新值为 None 时沿用旧值（保留数字 0）
 - merge_dict: 字典字段，智能合并（特殊处理历史字段）
 - keep_latest_list: 列表字段，始终采用最新值
 """
@@ -20,6 +21,17 @@ def keep_non_empty(left: Any, right: Any) -> Any:
     if right:
         return right
     return left if left else right
+
+
+def keep_number(left: Any, right: Any) -> Any:
+    """数值字段专用：仅当新值为 None（真正缺失）时才沿用旧值。
+
+    ``keep_non_empty`` 把 0 视为空值，对数值字段而言会误伤——「真的是 0」与
+    「未提供」无法区分。数值字段唯一表示缺失的是 None，0 是合法取值。
+    """
+    if right is None:
+        return left if left is not None else right
+    return right
 
 
 def merge_dict(left: dict, right: dict) -> dict:

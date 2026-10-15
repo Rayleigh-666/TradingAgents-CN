@@ -48,7 +48,9 @@ class RedisProgressTracker:
 
     def __init__(self, task_id: str, analysts: List[str], research_depth: str, llm_provider: str):
         self.task_id = task_id
-        self.analysts = analysts
+        # 上游可能把 analysts 写成 None（如 task_params 里 key 存在但值为 None），
+        # 统一归一化为列表，避免下游 len(self.analysts) 抛 TypeError
+        self.analysts = list(analysts or [])
         self.research_depth = research_depth
         self.llm_provider = llm_provider
 
