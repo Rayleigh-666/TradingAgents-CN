@@ -22,6 +22,7 @@ from app.core.market_codes import resolve_instrument
 from app.services.simple_analysis_service import _resolve_selected_analysts
 from app.services.unified_analysis_engine import (
     GENERAL_TICKER_SENTINEL,
+    apply_declared_lookback_default,
     apply_general_ticker_fallback,
 )
 from tradingagents.agents.utils.agent_utils import check_local_reddit_cache
@@ -160,3 +161,43 @@ def test_reddit_unavailable_when_data_dir_empty():
     available, reason = check_local_reddit_cache(data_dir="")
     assert available is False
     assert reason
+
+
+# ==================== 5. lookback_days 默认值只给「声明该字段」的流程 ====================
+
+
+def test_lookback_default_written_when_field_declared():
+    """流程声明了 lookback_days 字段（如流程 3）→ 补齐默认值 30。"""
+    wi = {"task_category": "general"}
+    assert apply_declared_lookback_default(wi, {"lookback_days", "analysis_target"}) == 30
+    assert wi["lookback_days"] == 30
+
+
+def test_lookback_default_skipped_when_field_not_declared():
+    """流程未声明该字段（如流程 1/2）→ 绝不注入默认值（否则会触发统一回溯指令）。"""
+    wi = {"task_category": "general", "analysis_target": "A股市场当日盘面复盘"}
+    assert apply_declared_lookback_default(wi, {"analysis_target", "market_type"}) is None
+    assert "lookback_days" not in wi
+
+
+def test_lookback_default_skipped_when_declared_set_empty():
+    """读库失败 → 空集合 / None → 不写（宁可缺失，也不误注入）。"""
+    wi = {"task_category": "general"}
+    assert apply_declared_lookback_default(wi, set()) is None
+    assert apply_declared_lookback_default(wi, None) is None
+    assert "lookback_days" not in wi
+
+
+def test_lookback_default_respects_existing_value():
+    """已显式提供的 lookback_days 不被覆盖（含合法 0，走 ``is None`` 判空）。"""
+    for existing in (5, 0, 20):
+        wi = {"task_category": "general", "lookback_days": existing}
+        assert apply_declared_lookback_default(wi, {"lookback_days"}) is None
+        assert wi["lookback_days"] == existing
+
+
+def test_lookback_default_not_gated_by_task_category_for_declared_flow():
+    """判定已从「task_category == general」收敛为「字段已声明」——凡声明即补。"""
+    wi = {"task_category": "stock_analysis"}  # 非 general，但只要声明了字段就补
+    assert apply_declared_lookback_default(wi, {"lookback_days"}) == 30
+    assert wi["lookback_days"] == 30

@@ -7,7 +7,7 @@
 - llm: 直接 LLM 调用
 """
 
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, Iterable
 import logging
 from datetime import datetime
 
@@ -118,6 +118,43 @@ def apply_general_trade_date_fallback(workflow_inputs: Dict[str, Any]) -> Option
 
     workflow_inputs["analysis_date"] = value
     return value
+
+
+def apply_declared_lookback_default(
+    workflow_inputs: Dict[str, Any],
+    declared_field_names: Optional[Iterable[str]],
+) -> Optional[int]:
+    """通用研究工作流：**仅当工作流的 ``input_config`` 声明了 ``lookback_days`` 字段时**
+    才补齐该入参的默认值（30）。
+
+    背景：``lookback_days`` 此前按 ``task_category == "general"`` 笼统门控补齐，但 4 条
+    general 流程里**只有流程 3** ``general_capital_flow_monitor`` 声明了该字段
+    （见 ``scripts/seed_general_workflows.py`` 的 ``_field("lookback_days", ...)``）。
+    流程 1/2 因此也被注入 ``lookback_days=30``，进而触发 ``index_analyst_v2`` 的
+    「统一回溯天数」指令，覆盖了提示词模板里写死的窗口（指数 60 / 北向与两融 10）——
+    实测流程 1 报告出现「工具统一回溯周期为 30 个交易日」。本函数把判定收敛为
+    「该工作流的 ``input_config`` 是否**声明**了 ``lookback_days`` 字段」。
+
+    读库失败时调用方传入空集合 → 不写默认值（宁可缺失，也不给未声明该字段的流程
+    误注入）。
+
+    Args:
+        workflow_inputs: 工作流输入参数字典（原地修改 lookback_days）
+        declared_field_names: 该工作流 ``input_config`` 已声明的字段名集合；
+            读库失败时应传空集合 / None。
+
+    Returns:
+        实际写入的默认值（30）；未做任何写入时返回 None。
+
+    注意：保留「显式判空」的外层写法（不要改用 setdefault —— key 存在但值为 None
+    时 setdefault 不生效），以匹配 ``tests/test_status_analysts_none.py`` 的源码字面量守卫。
+    """
+    declared = declared_field_names or ()
+    if workflow_inputs.get("lookback_days") is None:
+        if "lookback_days" in declared:
+            workflow_inputs["lookback_days"] = 30
+            return 30
+    return None
 
 
 class UnifiedAnalysisEngine:
@@ -729,12 +766,18 @@ class UnifiedAnalysisEngine:
         await self._inject_memory_facts(workflow_inputs)
 
         # 🆕 读取工作流的 input_config，根据字段定义补充缺失参数
+        # 同时记录该工作流**已声明**的字段名集合（declared_field_names），
+        # 供下方 lookback_days 默认值收敛判定（只给声明了该字段的流程补）。
+        declared_field_names: set = set()
         try:
             from app.core.database import get_mongo_db
             db = get_mongo_db()
             wf_doc = await db.workflows.find_one({"_id": workflow_id}, {"input_config": 1, "workflow_type": 1})
             if wf_doc and wf_doc.get("input_config"):
                 fields = wf_doc["input_config"].get("fields", [])
+                declared_field_names = {
+                    f.get("name") for f in fields if f.get("name")
+                }
                 for field in fields:
                     fname = field.get("name")
                     if fname and fname not in workflow_inputs and fname not in ("context",):
@@ -743,6 +786,9 @@ class UnifiedAnalysisEngine:
                             workflow_inputs[fname] = default_val
                             self.logger.debug(f"📋 从 input_config 补充参数: {fname}={default_val}")
         except Exception as e:
+            # 读库失败：declared_field_names 保持空集合 → 不写 lookback_days 默认值
+            # （宁可缺失，也不给未声明该字段的流程误注入）。
+            declared_field_names = set()
             self.logger.warning(f"⚠️ 读取 input_config 失败，使用硬编码默认值: {e}")
 
         # 🆕 通用研究工作流（task_category=general）没有个股代码。
@@ -779,13 +825,17 @@ class UnifiedAnalysisEngine:
         # 因为 0 可能是合法值（如 lookback_days=0），不能被误替换成默认值。
         if not workflow_inputs.get("research_depth"):
             workflow_inputs["research_depth"] = "标准"
-        # ⚠️ lookback_days 默认值**仅对 general 补齐**：该字段只存在于流程 3，若像原
-        # 来那样无条件写入，单股/ETF 等没有该字段的分析类型也会被塞入默认值；一旦
-        # lookback_days 被提升为动态 State 字段，就会泄漏并污染单股分析的取证窗口。
-        # 保留「显式判空」的外层写法（不要改用 setdefault）。
-        if workflow_inputs.get("lookback_days") is None:
-            if str(workflow_inputs.get("task_category") or "").strip().lower() == "general":
-                workflow_inputs["lookback_days"] = 30
+        # ⚠️ lookback_days 默认值**仅对「input_config 声明了该字段」的工作流补齐**：
+        # 4 条 general 流程里只有流程 3 general_capital_flow_monitor 声明了该字段，若按
+        # task_category == "general" 笼统补齐，流程 1/2 也会被注入 lookback_days=30，
+        # 进而触发 index_analyst_v2 的「统一回溯天数」指令、覆盖提示词模板里写死的窗口
+        # （实测流程 1 报告出现「工具统一回溯周期为 30 个交易日」）。收敛实现见
+        # apply_declared_lookback_default（内部保留「显式判空」的外层写法，勿改用 setdefault）。
+        _filled_lookback = apply_declared_lookback_default(workflow_inputs, declared_field_names)
+        if _filled_lookback is not None:
+            self.logger.debug(
+                f"📋 [declared] 工作流已声明字段 lookback_days → 引擎入参默认值 = {_filled_lookback}"
+            )
         if workflow_inputs.get("max_debate_rounds") is None:
             workflow_inputs["max_debate_rounds"] = 3
 

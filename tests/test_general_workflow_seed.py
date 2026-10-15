@@ -157,6 +157,55 @@ def test_capital_flow_monitor_drops_single_stock_market_node(workflows):
         assert edge.target in node_ids, f"流程 3 边目标不存在: {edge.target}"
 
 
+def test_market_emotion_cycle_has_research_manager_between_merge_and_debate(workflows):
+    """流程 2 必须含且仅含一个 research_manager_v2 节点，且位于 m_emo 与 d_risk 之间。
+
+    修复前流程 2 的 DAG 缺 ``research_manager_v2``：State 里永远没有
+    ``investment_plan``，而 ``trader_v2`` 的入参含 ``investment_plan``，导致
+    ``trader_investment_plan`` 每次退化为 54 字符错误桩
+    ``{'error': 'Missing investment_plan', 'success': False}``。
+    补节点后接续为：分析 → 研究经理 → 风险辩论 → 风控经理 → trader。
+    """
+    wf = next(w for w in workflows if w.id == "general_market_emotion_cycle")
+
+    rm_nodes = [n for n in wf.nodes if n.agent_id == "research_manager_v2"]
+    assert len(rm_nodes) == 1, (
+        f"流程 2 应含且仅含 1 个 research_manager_v2 节点，实际 {len(rm_nodes)}"
+    )
+    rm_id = rm_nodes[0].id
+    assert rm_id != "mgr", "新节点 id 不得与既有的 mgr(risk_manager_v2) 冲突"
+
+    edge_pairs = {(e.source, e.target) for e in wf.edges}
+    assert ("m_emo", rm_id) in edge_pairs, f"缺少边 m_emo → {rm_id}"
+    assert (rm_id, "d_risk") in edge_pairs, f"缺少边 {rm_id} → d_risk"
+
+    # 结构计数（补研究经理节点后：15 节点 / 20 边）
+    assert len(wf.nodes) == 15, f"流程 2 节点数应为 15，实际 {len(wf.nodes)}"
+    assert len(wf.edges) == 20, f"流程 2 边数应为 20，实际 {len(wf.edges)}"
+
+    # 无孤边：边两端节点必须存在
+    node_ids = {n.id for n in wf.nodes}
+    for edge in wf.edges:
+        assert edge.source in node_ids, f"流程 2 边源不存在: {edge.source}"
+        assert edge.target in node_ids, f"流程 2 边目标不存在: {edge.target}"
+
+    # 无孤立节点：除 start/end 外每个节点都有入边与出边
+    sources = {e.source for e in wf.edges}
+    targets = {e.target for e in wf.edges}
+    starts = {n.id for n in wf.nodes if n.type == NodeType.START.value}
+    ends = {n.id for n in wf.nodes if n.type == NodeType.END.value}
+    for nid in node_ids - starts:
+        assert nid in targets, f"流程 2 节点 {nid} 无入边（孤立）"
+    for nid in node_ids - ends:
+        assert nid in sources, f"流程 2 节点 {nid} 无出边（孤立）"
+
+    # 风险辩论语义不变：d_risk 仍指向三个 r_* 节点，participants 仍为节点 id
+    d_risk = next(n for n in wf.nodes if n.id == "d_risk")
+    assert d_risk.config.get("participants") == ["r_risky", "r_safe", "r_neutral"]
+    for pid in ("r_risky", "r_safe", "r_neutral"):
+        assert ("d_risk", pid) in edge_pairs, f"缺少风险辩论边 d_risk → {pid}"
+
+
 def test_input_config_analysis_target_shape(workflows):
     """每条流程都保留 analysis_target（textarea），并做字段 type 的通用校验。"""
     for wf in workflows:

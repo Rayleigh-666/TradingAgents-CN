@@ -275,23 +275,30 @@ def build_market_emotion_cycle() -> WorkflowDefinition:
               label="大盘分析师", x=1080, y=260, config={"focus": "指数位置与市场宽度"}),
         _node("m_emo", NodeType.MERGE, label="汇总分析", x=600, y=400,
               config={"strategy": "wait_all"}),
-        _node("d_risk", NodeType.DEBATE, label="风险情景辩论", x=600, y=520,
+        # 🆕 研究经理：产出 investment_plan，供下游风险辩论与 trader_v2 消费。
+        # 修复前流程 2 没有该节点，State 里永远没有 investment_plan，导致
+        # trader_v2（入参含 investment_plan）每次返回 54 字符错误桩
+        # `{'error': 'Missing investment_plan', 'success': False}`。
+        # 节点 id 用 mgr_research（已存在的 mgr 是 risk_manager_v2，不可复用）。
+        _node("mgr_research", NodeType.MANAGER, agent_id="research_manager_v2",
+              label="研究经理", x=600, y=520),
+        _node("d_risk", NodeType.DEBATE, label="风险情景辩论", x=600, y=650,
               config={
                   "participants": ["r_risky", "r_safe", "r_neutral"],
                   "rounds": "auto",
                   "description": "三方就当前情绪阶段与仓位区间展开多轮讨论",
               }),
         _node("r_risky", NodeType.RISK, agent_id="risky_analyst_v2",
-              label="高弹性情景分析师", x=280, y=640),
+              label="高弹性情景分析师", x=280, y=780),
         _node("r_safe", NodeType.RISK, agent_id="safe_analyst_v2",
-              label="防御情景分析师", x=600, y=640),
+              label="防御情景分析师", x=600, y=780),
         _node("r_neutral", NodeType.RISK, agent_id="neutral_analyst_v2",
-              label="基准情景分析师", x=920, y=640),
+              label="基准情景分析师", x=920, y=780),
         _node("mgr", NodeType.MANAGER, agent_id="risk_manager_v2",
-              label="风险评估师", x=600, y=780),
+              label="风险评估师", x=600, y=910),
         _node("trader", NodeType.TRADER, agent_id="trader_v2",
-              label="研究整合员", x=600, y=900),
-        _node("end", NodeType.END, label="结束", x=600, y=1020),
+              label="研究整合员", x=600, y=1040),
+        _node("end", NodeType.END, label="结束", x=600, y=1170),
     ]
     edges = [
         _edge("start", "p_emo"),
@@ -303,7 +310,8 @@ def build_market_emotion_cycle() -> WorkflowDefinition:
         _edge("a_social", "m_emo"),
         _edge("a_sector", "m_emo"),
         _edge("a_index", "m_emo"),
-        _edge("m_emo", "d_risk"),
+        _edge("m_emo", "mgr_research"),
+        _edge("mgr_research", "d_risk"),
         _edge("d_risk", "r_risky", label="发起", animated=True),
         _edge("d_risk", "r_safe", label="发起", animated=True),
         _edge("d_risk", "r_neutral", label="发起", animated=True),
