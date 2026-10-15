@@ -40,6 +40,7 @@ import pytest
 from app.models.analysis import AnalysisTaskType
 from app.routers.workflows import (
     _RESERVED_TASK_PARAM_KEYS,
+    _apply_lookback_days,
     _normalize_market_type,
     _sanitize_custom_params,
 )
@@ -335,4 +336,54 @@ def test_injected_task_category_cannot_bypass_symbol_check():
     )
     assert not ok, "被拦截的 task_category 不应让普通股票分析豁免 symbol"
     assert "symbol" in (err or "")
+
+
+# ==================== P2：lookback_days 不得用固定默认值注入 ====================
+
+
+def test_apply_lookback_days_none_writes_nothing():
+    """未显式提供（None）→ **不得**写入 lookback_days 键。
+
+    这是本缺陷的核心：请求模型默认 30 会让每一次执行都无条件注入该参数，
+    而它已升格为动态 State 字段、驱动 index_analyst_v2 的「统一回溯天数」指令，
+    从而改变未声明该字段的流程（流程 1/2）与单股分析的数据窗口。
+    """
+    task_params = {"market_type": "cn"}
+    assert _apply_lookback_days(task_params, None) is False
+    assert "lookback_days" not in task_params
+
+
+def test_apply_lookback_days_explicit_writes_value():
+    """显式提供 45 → 原样写入。"""
+    task_params = {"market_type": "cn"}
+    assert _apply_lookback_days(task_params, 45) is True
+    assert task_params["lookback_days"] == 45
+
+
+def test_apply_lookback_days_does_not_touch_other_keys():
+    task_params = {"market_type": "cn", "research_depth": "标准"}
+    _apply_lookback_days(task_params, 45)
+    assert task_params == {"market_type": "cn", "research_depth": "标准", "lookback_days": 45}
+
+
+def test_request_model_lookback_days_defaults_to_none():
+    """请求模型层：不传 lookback_days → ``data.lookback_days is None``（而非 30）。"""
+    from app.routers.workflows import WorkflowExecuteRequest
+
+    data = WorkflowExecuteRequest(ticker="600519")
+    assert data.lookback_days is None
+
+
+def test_request_model_lookback_days_explicit_value_kept():
+    """请求模型层：显式传 45 → 等于 45；约束 ge/le 仍然生效。"""
+    from app.routers.workflows import WorkflowExecuteRequest
+
+    data = WorkflowExecuteRequest(ticker="600519", lookback_days=45)
+    assert data.lookback_days == 45
+
+    with pytest.raises(Exception):
+        WorkflowExecuteRequest(ticker="600519", lookback_days=0)
+    with pytest.raises(Exception):
+        WorkflowExecuteRequest(ticker="600519", lookback_days=366)
+
 

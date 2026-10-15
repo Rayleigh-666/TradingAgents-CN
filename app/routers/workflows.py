@@ -75,6 +75,31 @@ def _sanitize_custom_params(
     return clean, sorted(dropped_reserved)
 
 
+def _apply_lookback_days(
+    task_params: Dict[str, Any],
+    lookback_days: Optional[int],
+) -> bool:
+    """把请求里的 ``lookback_days`` 写入 ``task_params`` —— **仅当调用方显式提供时**。
+
+    为什么不能给固定的默认值（如 30）：``lookback_days`` 已升格为 LangGraph 动态
+    State 字段，``core/agents/adapters/index_analyst_v2.py`` 一旦在 state 里见到该键
+    就会向提示词追加「统一回溯天数」指令。若请求模型带默认值，则**每一次**执行都会
+    无条件注入该参数，从而改变那些根本没有声明该字段的流程（流程 1/2）乃至复用同一
+    agent 的单股分析（``v2_stock_analysis_workflow``）的数据窗口 —— 它们没有任何 UI
+    能让用户控制这个值，属于不该发生的行为变化。
+
+    用 ``is not None`` 判空而非真值判断（``if lookback_days:``）：语义上「未提供」就是
+    None；``ge=1`` 虽已排除 0，但显式判 None 更清晰、也不易被后代误改。
+
+    Returns:
+        实际写入返回 True；未写入返回 False。
+    """
+    if lookback_days is not None:
+        task_params["lookback_days"] = lookback_days
+        return True
+    return False
+
+
 def _resolve_market_and_symbol(
     ticker: Optional[str],
     custom_params: Optional[Dict[str, Any]],
@@ -203,7 +228,10 @@ class WorkflowExecuteRequest(BaseModel):
     # 新的完整模型配置
     quick_model_config: Optional[ModelConfig] = Field(default=None, description="快速分析模型完整配置")
     deep_model_config: Optional[ModelConfig] = Field(default=None, description="深度分析模型完整配置")
-    lookback_days: int = Field(default=30, ge=1, le=365)
+    # ⚠️ 不能给固定默认值（如 30）：该字段已升格为动态 State 字段并驱动
+    # index_analyst_v2 的「统一回溯天数」指令，无条件注入会改变未声明该字段的流程
+    # （流程 1/2）与单股分析的数据窗口。故默认 None，仅在调用方显式提供时才写入。
+    lookback_days: Optional[int] = Field(default=None, ge=1, le=365)
     max_debate_rounds: int = Field(default=3, ge=1, le=10)
     # 🆕 自定义参数（透传到 task_params，用于通用研究等场景）
     custom_params: Dict[str, Any] = Field(
@@ -413,7 +441,8 @@ async def execute_workflow(
         task_params["research_depth"] = data.research_depth
         task_params["quick_analysis_model"] = data.quick_analysis_model
         task_params["deep_analysis_model"] = data.deep_analysis_model
-        task_params["lookback_days"] = data.lookback_days
+        # 仅当调用方显式提供 lookback_days 时才写入（详见 _apply_lookback_days 注释）。
+        _apply_lookback_days(task_params, data.lookback_days)
         task_params["max_debate_rounds"] = data.max_debate_rounds
         if data.selected_analysts:
             task_params["selected_analysts"] = data.selected_analysts
