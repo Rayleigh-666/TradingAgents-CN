@@ -1,7 +1,6 @@
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, AIMessage
 from typing import List
 from typing import Annotated
-from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import RemoveMessage
 from langchain_core.tools import tool
@@ -22,55 +21,6 @@ from tradingagents.utils.tool_logging import log_tool_call, log_analysis_step
 # 导入日志模块
 from tradingagents.utils.logging_manager import get_logger
 logger = get_logger('agents')
-
-
-def check_local_reddit_cache(data_dir: Optional[str] = None) -> tuple:
-    """判断本地 Reddit 缓存是否可用 —— 美股情绪维度的**唯一**可用性门槛。
-
-    数据源真相（本函数存在的理由）：美股情绪走的 ``get_reddit_company_news`` /
-    ``get_reddit_global_news``（``tradingagents/dataflows/interface.py``）最终调用
-    ``tradingagents/dataflows/news/reddit.py::fetch_top_from_category``，
-    **读的是本地缓存目录** ``<data_dir>/reddit_data/<category>/*.jsonl``：
-    不发网络请求，也**不读** ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET``。
-    因此本维度是否可用只取决于「本地缓存里有没有 ``.jsonl``」。历史实现按
-    ``REDDIT_*`` 凭证判断是**错的门槛**：有凭证但缓存为空时照样空转，
-    而缓存存在却没配凭证时反而被判「不可用」。
-
-    路径推导与 ``interface.py`` **同源**：直接复用它的模块级常量 ``DATA_DIR``
-    （即 ``DATA_DIR = config_manager.get_data_dir()``，import 时求值一次），
-    再拼 ``reddit_data``（对应 ``interface.py`` 的
-    ``os.path.join(DATA_DIR, "reddit_data")``），不另写一套路径规则、也不另取一次配置。
-    若这里改为每次调用重新执行 ``config_manager.get_data_dir()``，运行期 ``set_data_dir``
-    一旦改过配置，本门控就会与数据源实际读取的目录不一致，从而误判缓存可用性。
-
-    Args:
-        data_dir: 显式指定数据目录（测试用）；为 None 时读 ``interface.DATA_DIR``。
-
-    Returns:
-        ``(available, reason)``：可用时 ``(True, "")``；不可用时 ``(False, <原因>)``，
-        原因用于下游输出「数据源不可用」的显式降级说明。
-    """
-    try:
-        if data_dir is None:
-            data_dir = interface.DATA_DIR
-    except Exception as e:  # 路径推导失败 → 按不可用处理，并说明原因
-        return False, f"无法解析数据目录: {e}"
-
-    if not data_dir:
-        return False, "数据目录未配置"
-
-    reddit_dir = os.path.join(data_dir, "reddit_data")
-    if not os.path.isdir(reddit_dir):
-        return False, f"本地 Reddit 缓存目录不存在: {reddit_dir}"
-
-    try:
-        for _root, _dirs, files in os.walk(reddit_dir):
-            if any(name.endswith(".jsonl") for name in files):
-                return True, ""
-    except Exception as e:
-        return False, f"读取本地 Reddit 缓存失败: {e}"
-
-    return False, f"本地 Reddit 缓存为空（无 .jsonl）: {reddit_dir}"
 
 
 def create_msg_delete():

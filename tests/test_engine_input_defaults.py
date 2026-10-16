@@ -1,6 +1,7 @@
 """引擎入参兜底的回归测试（离线，直接调用生产代码）。
 
-覆盖四类近期修的真实故障：
+覆盖近期修的真实故障（第 1–3 类在本文件；第 4 类的门控测试已迁至
+``tests/unit/tools/test_reddit_cache_gate.py``）：
 
 1. 通用研究工作流（``task_category == "general"``）缺分析目标文本时的 ``ticker``
    兜底 —— 兜底**只对 general 生效**，且**绝不**回写 ``symbol`` / ``stock_code``。
@@ -10,8 +11,9 @@
 3. ``simple_analysis_service`` 的 ``selected_analysts`` 兜底 —— 原写法
    ``X if request.parameters else [...]`` 在 ``parameters`` 存在但属性为 None 时会把
    ``None`` 灌下去（``enumerate(None)`` → TypeError），须走统一的纯函数归一化。
-4. ``agent_utils`` 的 Reddit 可用性判定 —— 数据源只读本地缓存，不读 ``REDDIT_*``
-   凭证，故门槛应改为「本地缓存是否存在」，且需抽成可离线测试的纯函数。
+4. ``agent_utils`` 的 Reddit 可用性判定 —— 原为**无生产调用方**的重复实现（生产门控
+   在 ``core.tools.implementations.social.stock_sentiment``），已删除。该维度的
+   门控测试迁移到 ``tests/unit/tools/test_reddit_cache_gate.py``。
 """
 from __future__ import annotations
 
@@ -25,7 +27,6 @@ from app.services.unified_analysis_engine import (
     apply_declared_lookback_default,
     apply_general_ticker_fallback,
 )
-from tradingagents.agents.utils.agent_utils import check_local_reddit_cache
 
 
 # ==================== 1. ticker 兜底仅对 general 生效 ====================
@@ -125,42 +126,6 @@ def test_simple_analysis_service_no_longer_uses_fragile_ternary():
     assert 'if request.parameters else ["market"' not in source
     # 两处调用点都改用统一纯函数（避免再次漂移）
     assert source.count("_resolve_selected_analysts(request.parameters)") == 2
-
-
-# ==================== 4. Reddit 可用性判定（本地缓存） ====================
-
-
-def test_reddit_unavailable_when_cache_dir_missing(tmp_path):
-    """缓存目录不存在 → 不可用，并给出原因。"""
-    missing = tmp_path / "not_exist"
-    available, reason = check_local_reddit_cache(data_dir=str(missing))
-    assert available is False
-    assert reason  # 必须带原因，供下游输出显式降级说明
-
-
-def test_reddit_unavailable_when_no_jsonl(tmp_path):
-    """目录存在但没有 .jsonl → 不可用。"""
-    data_dir = tmp_path / "data"
-    (data_dir / "reddit_data" / "global_news").mkdir(parents=True)
-    available, reason = check_local_reddit_cache(data_dir=str(data_dir))
-    assert available is False
-    assert "reddit_data" in reason
-
-
-def test_reddit_available_when_jsonl_present(tmp_path):
-    """存在 .jsonl 缓存 → 可用（与 REDDIT_* 凭证无关）。"""
-    data_dir = tmp_path / "data"
-    category_dir = data_dir / "reddit_data" / "global_news"
-    category_dir.mkdir(parents=True)
-    (category_dir / "posts.jsonl").write_text("{}\n", encoding="utf-8")
-    assert check_local_reddit_cache(data_dir=str(data_dir)) == (True, "")
-
-
-def test_reddit_unavailable_when_data_dir_empty():
-    """数据目录为空串 → 不可用（推导失败按不可用处理）。"""
-    available, reason = check_local_reddit_cache(data_dir="")
-    assert available is False
-    assert reason
 
 
 # ==================== 5. lookback_days 默认值只给「声明该字段」的流程 ====================

@@ -7,7 +7,7 @@
 
 import logging
 import os
-from typing import Annotated, List, Tuple
+from typing import Annotated, List, Optional, Tuple
 from datetime import datetime, timedelta
 from langchain_core.tools import tool
 
@@ -399,20 +399,44 @@ def _build_chinese_sentiment(
     return result_data
 
 
-def _reddit_cache_unavailable_reason() -> str:
+def _reddit_cache_unavailable_reason(data_dir: Optional[str] = None) -> str:
     """返回「本地 Reddit 缓存不可用」的原因；缓存可用则返回空串。
 
-    路径与数据源**同源**：数据源在 tradingagents/dataflows/interface.py 里读的是
-    ``os.path.join(DATA_DIR, "reddit_data")/<category>/*.jsonl``，其中
-    ``DATA_DIR = config_manager.get_data_dir()``。这里直接复用同一个 ``DATA_DIR``，
-    不另写一份路径规则（否则两边一旦漂移就会误判可用性）。
-    """
-    try:
-        from tradingagents.dataflows.interface import DATA_DIR
-    except Exception as e:  # noqa: BLE001 - 取路径失败一律按不可用处理
-        return f"无法解析 Reddit 缓存目录：{e}"
+    本函数是**美股情绪维度的唯一可用性门控**（调用点见 ``_build_us_sentiment``）。
 
-    reddit_dir = os.path.join(DATA_DIR, "reddit_data")
+    数据源真相：``get_reddit_company_news`` / ``get_reddit_global_news``
+    （``tradingagents/dataflows/interface.py``）最终调
+    ``tradingagents/dataflows/news/reddit.py::fetch_top_from_category``，
+    **读的是本地缓存目录** ``os.path.join(DATA_DIR, "reddit_data")/<category>/*.jsonl``：
+    不发网络请求，也**不读** ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET``。
+    历史实现按 ``REDDIT_*`` 凭证判断是**错的门槛**——有凭证但缓存为空时照样空转，
+    缓存已存在却没配凭证时反而被判「不可用」。故门控只认「本地缓存里有没有 .jsonl」。
+
+    路径与数据源**同源**：数据源用的 ``DATA_DIR = config_manager.get_data_dir()``
+    是 ``interface.py`` 的模块级常量，这里直接复用同一个 ``DATA_DIR``，不另写一份
+    路径规则、也不每次重新执行 ``config_manager.get_data_dir()``——否则运行期
+    ``set_data_dir`` 改过配置后，门控会与数据源实际读取的目录不一致而误判。
+
+    Args:
+        data_dir: 显式指定数据目录（**仅测试注入用**）；为 ``None`` 时读
+            ``interface.DATA_DIR``。
+
+    Returns:
+        可用时返回空串；不可用时返回原因文本，供下游输出「本维度不可用」的显式
+        降级说明（原因文本会出现在报告中，**不含**文件系统绝对路径）。
+    """
+    if data_dir is None:
+        try:
+            from tradingagents.dataflows.interface import DATA_DIR
+
+            data_dir = DATA_DIR
+        except Exception as e:  # noqa: BLE001 - 取路径失败一律按不可用处理
+            return f"无法解析 Reddit 缓存目录：{e}"
+
+    if not data_dir:
+        return "数据目录未配置"
+
+    reddit_dir = os.path.join(data_dir, "reddit_data")
     if not os.path.isdir(reddit_dir):
         return "本地 Reddit 缓存目录不存在"
 
