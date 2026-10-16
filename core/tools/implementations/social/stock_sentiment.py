@@ -438,14 +438,28 @@ def _reddit_cache_unavailable_reason(data_dir: Optional[str] = None) -> str:
 
     reddit_dir = os.path.join(data_dir, "reddit_data")
     if not os.path.isdir(reddit_dir):
+        # 区分「路径压根不存在」（没预热过）与「路径存在但不是目录」（配置写错了）——
+        # 两者对使用者的指引不同，不能共用一句「目录不存在」。
+        if os.path.exists(reddit_dir):
+            return "本地 Reddit 缓存路径不是目录"
         return "本地 Reddit 缓存目录不存在"
 
+    # ⚠️ ``os.walk`` 默认 ``onerror=None`` 会**静默吞掉**遍历错误（PermissionError 等），
+    # 结果是「目录不可读」被报成「缓存为空」——把「读不到」说成「没有数据」，恰是本
+    # 函数最不该犯的错（该分支曾因此长期不可达）。这里把错误收进列表：
+    #   * 只要还能在别处找到 .jsonl，就仍判可用（单个分类目录坏掉不该拖垮整个维度）；
+    #   * 只有「一个 .jsonl 都没找到、同时确实发生过读取错误」才报读取失败，
+    #     绝不把不确定说成「没有数据」。
+    walk_errors: List[OSError] = []
     try:
-        for _root, _dirs, files in os.walk(reddit_dir):
+        for _root, _dirs, files in os.walk(reddit_dir, onerror=walk_errors.append):
             if any(name.endswith(".jsonl") for name in files):
                 return ""
-    except OSError as e:
+    except OSError as e:  # 兜底：walk 自身抛错（未走 onerror 回调的路径）
         return f"读取本地 Reddit 缓存目录失败：{e}"
+
+    if walk_errors:
+        return f"读取本地 Reddit 缓存目录失败：{walk_errors[0]}"
     return "本地 Reddit 缓存为空（无 .jsonl 文件）"
 
 

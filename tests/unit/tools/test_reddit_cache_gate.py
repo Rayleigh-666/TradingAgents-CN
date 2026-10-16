@@ -11,11 +11,15 @@
 调用方**，却独占了四条分支测试；而真正在跑的 ``_reddit_cache_unavailable_reason``
 当时只有一个「目录不存在」分支被间接覆盖（``test_sentiment_market_dispatch.py``）。
 现删副本，把四条分支 + 可用分支全部落到生产实现上，并加「唯一真源」守卫。
+
+迁移时还顺带查实一个**既存死分支**：``except OSError`` 那段在真实文件系统下不可达，
+因为 ``os.walk`` 默认 ``onerror=None`` 会静默吞掉 ``PermissionError`` —— 于是「目录
+不可读」被报成「缓存为空」。已改为收集 ``onerror`` 错误，并由 §2b 的用例锁定。
 """
 
 from __future__ import annotations
 
-import re
+import os
 import sys
 import types
 from pathlib import Path
@@ -32,6 +36,7 @@ AGENT_UTILS_FILE = (
 
 # 生产实现的判据文案（会出现在报告正文里，故不含文件系统绝对路径）
 REASON_NO_DIR = "本地 Reddit 缓存目录不存在"
+REASON_NOT_A_DIR = "本地 Reddit 缓存路径不是目录"
 REASON_EMPTY = "本地 Reddit 缓存为空（无 .jsonl 文件）"
 REASON_NO_DATA_DIR = "数据目录未配置"
 
@@ -87,6 +92,63 @@ def test_available_when_jsonl_in_nested_subdir(tmp_path):
     data_dir = tmp_path / "data"
     _make_cache(data_dir, relpath="company_news/2026-10", name="AAPL.jsonl")
     assert ss._reddit_cache_unavailable_reason(str(data_dir)) == ""
+
+
+# ==================== 2b. 路径异常 / 读取失败（不得报成「缓存为空」） ====================
+
+
+def test_reason_when_path_exists_but_is_not_a_dir(tmp_path):
+    """``reddit_data`` 存在但是个文件 → 必须与「目录不存在」区分开。
+
+    两种情况的处置完全不同：目录不存在 = 没预热过；路径被文件占了 = 配置/环境写错。
+    共用一句「目录不存在」会把后者引向错误的排查方向。
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "reddit_data").write_text("not a dir\n", encoding="utf-8")
+
+    reason = ss._reddit_cache_unavailable_reason(str(data_dir))
+
+    assert reason == REASON_NOT_A_DIR
+    assert reason != REASON_NO_DIR
+
+
+def test_unreadable_cache_dir_is_not_reported_as_empty(tmp_path):
+    """目录不可读时必须报「读取失败」，**绝不**报「缓存为空」。
+
+    ``os.walk`` 默认 ``onerror=None`` 会静默吞掉 ``PermissionError``（实测返回 0 个
+    条目、不抛异常），于是「读不到」被说成「没有数据」——正是本门控最不该犯的错。
+    本用例以 chmod 000 强制该情形，锁定修复后的行为。
+    """
+    if os.geteuid() == 0:  # root 绕过权限位，chmod 000 不构成障碍
+        pytest.skip("以 root 运行，无法用权限位构造不可读目录")
+
+    data_dir = tmp_path / "data"
+    cache_dir = _make_cache(data_dir).parent  # data_dir/reddit_data
+    os.chmod(cache_dir, 0o000)
+    try:
+        reason = ss._reddit_cache_unavailable_reason(str(data_dir))
+    finally:
+        os.chmod(cache_dir, 0o755)  # 让 pytest 能清理 tmp_path
+
+    assert reason.startswith("读取本地 Reddit 缓存目录失败"), reason
+    assert reason != REASON_EMPTY
+
+
+def test_available_even_if_one_category_dir_is_unreadable(tmp_path):
+    """单个分类目录坏掉不该拖垮整个维度：别处有 .jsonl 就仍判可用。"""
+    if os.geteuid() == 0:
+        pytest.skip("以 root 运行，无法用权限位构造不可读目录")
+
+    data_dir = tmp_path / "data"
+    cache_dir = _make_cache(data_dir, relpath="global_news")  # 可读，含 .jsonl
+    locked = cache_dir.parent / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0o000)
+    try:
+        assert ss._reddit_cache_unavailable_reason(str(data_dir)) == ""
+    finally:
+        os.chmod(locked, 0o755)
 
 
 # ==================== 3. 门槛不是凭据 ====================
@@ -167,27 +229,34 @@ def test_legacy_duplicate_gate_is_gone():
     assert not hasattr(agent_utils, "check_local_reddit_cache")
 
 
-def test_reddit_data_path_is_read_only_where_expected():
-    """生产代码里读取 ``reddit_data`` 的位置仅限「数据源」与「门控」两处。
+def test_only_one_module_emits_reddit_cache_verdicts():
+    """产出「Reddit 缓存可用性判据」的模块只能有一个。
 
-    静态扫描 ``os.path.join(..., "reddit_data")``：允许出现于
-    ``dataflows/interface.py``（数据源）与 ``stock_sentiment.py``（门控）——
-    若第三个文件冒出来，先确认它不是又一份重复实现。
+    判据口径 = 文件里**同时**出现 ``reddit_data`` 与门控的原因文案
+    （``本地 Reddit 缓存``）。只扫 ``os.path.join(..., "reddit_data")`` 会把纯数据源
+    读者也算进来——``interface.py`` 只是拼路径、不产出任何判据——那样守卫会因无关改动
+    误报。扫描范围含 ``cli/`` ``scripts/`` ``migrations/`` ``install/``：初版只扫
+    ``core/tradingagents/app``，漏掉了这四个目录。
+
+    ⚠️ 局限（须知）：这是**廉价绊线，不是证明**。改用 ``Path(DATA_DIR) / "reddit_data"``、
+    或另起一套原因文案的重复实现不会被捕获——那类漂移仍靠
+    ``test_legacy_duplicate_gate_is_gone`` 这类具名断言兜。
     """
     allowed = {
-        PROJECT_ROOT / "tradingagents" / "dataflows" / "interface.py",
         PROJECT_ROOT / "core" / "tools" / "implementations" / "social" / "stock_sentiment.py",
     }
-    pattern = re.compile(r'os\.path\.join\([^)\n]*["\']reddit_data["\']')
     found: set[Path] = set()
-    for root_name in ("core", "tradingagents", "app"):
-        for path in (PROJECT_ROOT / root_name).rglob("*.py"):
+    for root_name in ("core", "tradingagents", "app", "cli", "scripts", "migrations", "install"):
+        root = PROJECT_ROOT / root_name
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.py"):
             text = path.read_text(encoding="utf-8", errors="ignore")
-            if pattern.search(text):
+            if "reddit_data" in text and "本地 Reddit 缓存" in text:
                 found.add(path)
 
     assert found == allowed, (
-        "reddit_data 路径读取点发生变化："
+        "Reddit 缓存判据的来源发生变化："
         f"多出 {sorted(str(p) for p in found - allowed)}，"
         f"缺少 {sorted(str(p) for p in allowed - found)}"
     )
