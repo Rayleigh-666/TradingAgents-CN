@@ -318,9 +318,26 @@ def compute_concentration(
     - 部分缺失时用已提供权重的均值填充，并在 warnings 说明；
     - HHI = Σ w_i^2（w_i 为 0~1 的小数权重），同时给出 ×10000 的「点数」口径。
 
+    口径：
+        ① 集中度是**标的级**指标：同一 ``code`` 出现多行时（分批建仓，各行可带不同成本价），
+           先按 code 合并权重，再计算 ``top1_pct``/``top3_pct``/``top5_pct``/``hhi``。
+           按行计算等于把一个风险敞口劈成多份，会系统性**低估**集中度。
+        ② 缺失权重仍按**行级**填充（用已提供行权重的均值），**填充之后**再按 code 聚合；
+           ``weight_basis="mixed"`` 的语义与相关告警文案不变。
+        ③ 返回的 ``weights_used`` 与 ``top1_pct``/``hhi`` 口径一致，恒满足两条不变式::
+
+               top1_pct == max(weights_used.values())
+               hhi      ≈ Σ (w / 100)²      （w 取 weights_used.values()）
+
+           ``weights_used`` 为四舍五入到 2 位的展示值，故第二条不变式比较时需带小容差。
+        ④ ``sum_input_pct`` 是**行级**原始输入权重之和（描述用户输入，不参与计算，
+           也不随按 code 聚合而改变）。
+
     Returns:
         ``{"top1_pct","top3_pct","top5_pct","hhi","hhi_points","judgement",
-           "weight_basis","weights_used","sum_input_pct"}``；positions 为空时返回 None。
+           "weight_basis","weights_used","sum_input_pct","merged_codes"}``；
+        ``merged_codes`` 为 ``{code: 行数}``（仅含出现多行的 code，无重复时为空 dict）；
+        positions 为空时返回 None。
     """
     warn = warnings if warnings is not None else []
     n = len(positions)
@@ -359,23 +376,28 @@ def compute_concentration(
         warn.append("权重合计非正，已回退为等权计算集中度。")
 
     norm = [w / total * 100.0 for w in weights]
-    ordered = sorted(norm, reverse=True)
-    fracs = [w / 100.0 for w in norm]
-    hhi = sum(f * f for f in fracs)
 
-    # weights_used 按 code 求和：同一 code 出现多行时，后者不得覆盖前者（否则展示值
-    # 会与 HHI 使用的多行权重口径自相矛盾）。出现多行时显式告警「权重已合并」。
-    weights_used: Dict[str, float] = {}
+    by_code: Dict[str, float] = {}
+    rows_per_code: Dict[str, int] = {}
     for p, w in zip(positions, norm):
-        weights_used[p["code"]] = weights_used.get(p["code"], 0.0) + w
-    weights_used = {code: round(w, 2) for code, w in weights_used.items()}
+        code = p["code"]
+        by_code[code] = by_code.get(code, 0.0) + w
+        rows_per_code[code] = rows_per_code.get(code, 0) + 1
 
-    dup_codes = sorted(
-        {c for c in (p["code"] for p in positions)
-         if sum(1 for p in positions if p["code"] == c) > 1}
-    )
-    if dup_codes:
-        warn.append(f"标的 {'、'.join(dup_codes)} 出现多行，权重已合并。")
+    # 集中度是**标的级**风险指标：同一 code 的多行是同一个风险敞口，必须先合并再算。
+    # 按行算等于把一个敞口劈成两份，会系统性**低估**集中度——实测 600519 两行 30%/20%
+    # 时按行得 HHI 0.3438，而真实敞口 50/30 对应 0.5312。合并后 weights_used 与
+    # top1_pct/hhi 口径一致，恒满足：
+    #     top1_pct == max(weights_used.values())
+    #     hhi      ≈ Σ (w/100)²   （w 取 weights_used.values()）
+    ordered = sorted(by_code.values(), reverse=True)
+    hhi = sum((x / 100.0) ** 2 for x in ordered)
+    weights_used = {code: round(w, 2) for code, w in by_code.items()}
+
+    merged_codes = {c: n for c, n in sorted(rows_per_code.items()) if n > 1}
+    if merged_codes:
+        detail = "、".join(f"{c}（{n} 行）" for c, n in merged_codes.items())
+        warn.append(f"标的 {detail} 出现多行，权重已合并计算。")
 
     return {
         "top1_pct": round(ordered[0], 2),
@@ -387,6 +409,7 @@ def compute_concentration(
         "weight_basis": weight_basis,
         "weights_used": weights_used,
         "sum_input_pct": round(sum(provided), 2) if provided else None,
+        "merged_codes": merged_codes,
     }
 
 
@@ -768,8 +791,14 @@ def render_portfolio_report(
             "mixed": "部分权重缺失，缺失项按均值填充后计算",
         }.get(conc.get("weight_basis"), "按归一化权重计算")
         lines.append(f"- 权重口径：{basis_label}（已归一化到合计 100%）")
+        merged = conc.get("merged_codes") or {}
+        if merged:
+            detail = "、".join(f"{c} × {n} 行" for c, n in sorted(merged.items()))
+            lines.append(f"- 集中度口径：按标的计算；同一标的的多行权重已先合并（{detail}）")
+        else:
+            lines.append("- 集中度口径：按标的计算")
         if conc.get("sum_input_pct") is not None:
-            lines.append(f"- 原始权重合计：{conc['sum_input_pct']:.2f}%")
+            lines.append(f"- 原始权重合计（按行、未归一化）：{conc['sum_input_pct']:.2f}%")
     lines.append("")
 
     # ---- 3. 组合风险指标 ----

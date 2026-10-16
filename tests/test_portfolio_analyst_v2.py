@@ -389,6 +389,10 @@ def test_duplicate_code_weights_merged_and_warned():
     conc = pa.compute_concentration(positions, warnings)
     # 归一化后两行为 60% / 40%，按 code 合并 = 100%（而非后者覆盖前的 40%）
     assert conc["weights_used"] == {"600519": 100.0}
+    # 合并后集中度按标的算：唯一标的独占 100%，HHI = 1.0（旧「按行」口径只有 0.52）
+    assert conc["top1_pct"] == 100.0
+    assert conc["hhi"] == 1.0
+    assert conc["merged_codes"] == {"600519": 2}
     assert any("多行" in w and "已合并" in w for w in warnings)
 
 
@@ -648,3 +652,110 @@ def test_extract_excluded_uses_precise_match():
     # 精确命中则取该告警
     excluded2 = pa._extract_excluded(["000858"], [], ["000858 数据不足，已排除。"])
     assert "000858 数据不足" in excluded2[0]["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# 20. R2 口径：集中度按**标的**聚合（先合并同 code 多行，再算 topN/HHI）
+# --------------------------------------------------------------------------- #
+def test_concentration_duplicate_codes_merged_by_symbol():
+    """两个重复 code 的输入：权重先按标的合并，再算集中度（而非按行分开算）。
+
+    锁的是：600519 两行 30%/20% 是同一个敞口 50%，合并后 50/(50+30)=62.5%；
+    旧「按行」口径会把这一个敞口劈成两份，得到被低估的 37.5% / HHI 0.3438。
+    """
+    positions, warnings = pa.parse_holdings("600519,30\n600519,20\n000001,30")
+    conc = pa.compute_concentration(positions, warnings)
+    assert conc["top1_pct"] == 62.5
+    assert conc["hhi"] == 0.5312
+    assert conc["hhi_points"] == 5312.5
+    assert conc["weights_used"] == {"600519": 62.5, "000001": 37.5}
+    assert conc["merged_codes"] == {"600519": 2}
+    # sum_input_pct 仍是**行级**原始输入之和（80 = 30 + 20 + 30），不随聚合改变
+    assert conc["sum_input_pct"] == 80.0
+    assert conc["weight_basis"] == "provided"
+
+
+def test_concentration_no_duplicate_codes_unchanged():
+    """无重复 code 时，按标的聚合与按行计算逐字等价（零影响护栏的数值对照）。"""
+    positions, warnings = pa.parse_holdings("600519,30\n000001,70")
+    conc = pa.compute_concentration(positions, warnings)
+    assert conc["top1_pct"] == 70.0
+    assert conc["hhi"] == 0.58
+    assert conc["hhi_points"] == 5800.0
+    assert conc["weights_used"] == {"600519": 30.0, "000001": 70.0}
+    assert conc["merged_codes"] == {}
+    assert conc["sum_input_pct"] == 100.0
+
+
+def test_concentration_missing_weight_filled_per_row_then_merged():
+    """缺权重行先按**行级**均值填充，填充之后再按 code 聚合。
+
+    输入 600519,30 / 600519（缺权重）：provided=[30] → 均值 30 填充第二行，
+    两行都是 30 → 归一化 50/50 → 同一标的聚合为 100%。
+    """
+    positions, warnings = pa.parse_holdings("600519,30\n600519")
+    conc = pa.compute_concentration(positions, warnings)
+    assert conc["weight_basis"] == "mixed"
+    assert conc["top1_pct"] == 100.0
+    assert conc["hhi"] == 1.0
+    assert conc["hhi_points"] == 10000.0
+    assert conc["weights_used"] == {"600519": 100.0}
+    assert conc["merged_codes"] == {"600519": 2}
+    assert conc["sum_input_pct"] == 30.0
+
+
+def test_concentration_mixed_fill_then_merge_across_symbols():
+    """三行含一只缺权重标的：行级均值填充 → 按 code 聚合 → 66.67 / 33.33。"""
+    positions, warnings = pa.parse_holdings("600519,30\n600519\n000001,30")
+    conc = pa.compute_concentration(positions, warnings)
+    assert conc["weight_basis"] == "mixed"
+    assert conc["top1_pct"] == 66.67
+    assert conc["hhi"] == 0.5556
+    assert conc["hhi_points"] == 5555.6
+    assert conc["weights_used"] == {"600519": 66.67, "000001": 33.33}
+    assert conc["merged_codes"] == {"600519": 2}
+    assert conc["sum_input_pct"] == 60.0
+
+
+def test_concentration_weights_used_consistent_with_top1_and_hhi():
+    """不变式：weights_used 与 top1_pct / hhi 口径一致。
+
+    top1_pct == max(weights_used.values()) 精确成立；hhi 用 weights_used 复算时需带
+    ``abs=1e-3`` 容差——因为 weights_used 是四舍五入到 2 位的**展示值**，
+    用它复算 HHI 与内部未取整的 hhi 之间会有微小舍入差。
+    """
+    positions, warnings = pa.parse_holdings("600519,30\n600519,20\n000001,30")
+    conc = pa.compute_concentration(positions, warnings)
+    assert conc["top1_pct"] == max(conc["weights_used"].values())
+    assert conc["hhi"] == pytest.approx(
+        sum((w / 100.0) ** 2 for w in conc["weights_used"].values()), abs=1e-3
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 21. R2 报告正文：集中度口径行（说明已按标的合并，避免与逐行明细矛盾）
+# --------------------------------------------------------------------------- #
+def test_report_renders_concentration_basis_with_merge():
+    """有重复 code 时，§二 必须显式说明「按标的计算」并列出被合并的标的多行明细。
+
+    锁的是：§一 渲染的是逐行明细（600519 两行），若 §二 不说明已合并，
+    读者看到 3 行明细 + top1=62.5% 会以为算错。
+    """
+    positions = [_pos("600519", 30.0), _pos("600519", 20.0), _pos("000001", 30.0)]
+    warnings = []
+    conc = pa.compute_concentration(positions, warnings)
+    facts = {"positions": positions, "warnings": warnings, "concentration": conc}
+    report = pa.render_portfolio_report(facts)
+    assert "按标的计算" in report
+    assert "600519 × 2 行" in report
+
+
+def test_report_renders_concentration_basis_without_merge():
+    """无重复 code 时也写「按标的计算」，但不出现「已先合并」字样。"""
+    positions = [_pos("600519", 30.0), _pos("000001", 70.0)]
+    warnings = []
+    conc = pa.compute_concentration(positions, warnings)
+    facts = {"positions": positions, "warnings": warnings, "concentration": conc}
+    report = pa.render_portfolio_report(facts)
+    assert "按标的计算" in report
+    assert "已先合并" not in report
