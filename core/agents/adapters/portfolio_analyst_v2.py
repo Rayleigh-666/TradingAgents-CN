@@ -324,12 +324,19 @@ def compute_concentration(
            按行计算等于把一个风险敞口劈成多份，会系统性**低估**集中度。
         ② 缺失权重仍按**行级**填充（用已提供行权重的均值），**填充之后**再按 code 聚合；
            ``weight_basis="mixed"`` 的语义与相关告警文案不变。
-        ③ 返回的 ``weights_used`` 与 ``top1_pct``/``hhi`` 口径一致，恒满足两条不变式::
+        ③ 返回的 ``weights_used`` 与 ``top1_pct``/``hhi`` 口径一致，恒满足三条不变式::
 
-               top1_pct == max(weights_used.values())
-               hhi      ≈ Σ (w / 100)²      （w 取 weights_used.values()）
+               top1_pct    == max(weights_used.values())
+               hhi         ≈  Σ (w / 100)²   （w 取 weights_used.values()）
+               hhi_points  == round(hhi * 10000, 1)
 
-           ``weights_used`` 为四舍五入到 2 位的展示值，故第二条不变式比较时需带小容差。
+           ``weights_used`` 为四舍五入到 2 位的展示值，故第二条不变式比较时需带小容差
+           （实测最大偏差 1.42e-4，因其各项之和恒为 100，理论上限约 1e-3）。
+           第三条中右边的 ``hhi`` 指**本函数返回的**（已取整到 4 位的）值——HHI 的两个
+           展示口径必须能互相推导，否则报告会印出 ``HHI：0.5312（5312.5 点）`` 这种
+           读者一算就对不上的组合。注意第二条反过来说**不成立**：把 ``weights_used``
+           各项（2 位小数）相加可能不等于 100（如 3 个 code 各 33.333 → 99.99），
+           该字段仅供机器读取、不进报告正文。
         ④ ``sum_input_pct`` 是**行级**原始输入权重之和（描述用户输入，不参与计算，
            也不随按 code 聚合而改变）。
 
@@ -391,7 +398,12 @@ def compute_concentration(
     #     top1_pct == max(weights_used.values())
     #     hhi      ≈ Σ (w/100)²   （w 取 weights_used.values()）
     ordered = sorted(by_code.values(), reverse=True)
-    hhi = sum((x / 100.0) ** 2 for x in ordered)
+
+    # HHI 有两个展示口径：0~1 小数与「点数」（×10000）。两者是**同一个量**，
+    # 必须能互相推导，否则报告里会印出 `HHI：0.5312（5312.5 点）` 这种读者一算就
+    # 对不上的组合（0.5312×10000 = 5312.0）。因此先把小数口径**定稿**，点数与定性
+    # 判断都从这同一个定稿值派生——单一真源，不各自取整。
+    hhi = round(sum((x / 100.0) ** 2 for x in ordered), 4)
     weights_used = {code: round(w, 2) for code, w in by_code.items()}
 
     merged_codes = {c: n for c, n in sorted(rows_per_code.items()) if n > 1}
@@ -403,7 +415,7 @@ def compute_concentration(
         "top1_pct": round(ordered[0], 2),
         "top3_pct": round(sum(ordered[:3]), 2),
         "top5_pct": round(sum(ordered[:5]), 2),
-        "hhi": round(hhi, 4),
+        "hhi": hhi,
         "hhi_points": round(hhi * 10000, 1),
         "judgement": _hhi_judgement(hhi),
         "weight_basis": weight_basis,

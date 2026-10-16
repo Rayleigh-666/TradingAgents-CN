@@ -667,7 +667,10 @@ def test_concentration_duplicate_codes_merged_by_symbol():
     conc = pa.compute_concentration(positions, warnings)
     assert conc["top1_pct"] == 62.5
     assert conc["hhi"] == 0.5312
-    assert conc["hhi_points"] == 5312.5
+    # 点数由**定稿的** 4 位小数口径派生（0.5312×10000），而非从未取整值算——否则
+    # 报告会印出 `HHI：0.5312（5312.5 点）`，读者一乘就对不上。见
+    # test_hhi_points_is_derivable_from_returned_hhi。
+    assert conc["hhi_points"] == 5312.0
     assert conc["weights_used"] == {"600519": 62.5, "000001": 37.5}
     assert conc["merged_codes"] == {"600519": 2}
     # sum_input_pct 仍是**行级**原始输入之和（80 = 30 + 20 + 30），不随聚合改变
@@ -711,7 +714,7 @@ def test_concentration_mixed_fill_then_merge_across_symbols():
     assert conc["weight_basis"] == "mixed"
     assert conc["top1_pct"] == 66.67
     assert conc["hhi"] == 0.5556
-    assert conc["hhi_points"] == 5555.6
+    assert conc["hhi_points"] == 5556.0  # 由定稿的 0.5556 ×10000 派生
     assert conc["weights_used"] == {"600519": 66.67, "000001": 33.33}
     assert conc["merged_codes"] == {"600519": 2}
     assert conc["sum_input_pct"] == 60.0
@@ -730,6 +733,25 @@ def test_concentration_weights_used_consistent_with_top1_and_hhi():
     assert conc["hhi"] == pytest.approx(
         sum((w / 100.0) ** 2 for w in conc["weights_used"].values()), abs=1e-3
     )
+    # 第三条：HHI 的两个展示口径（0~1 小数 / ×10000 点数）必须能互相推导
+    assert conc["hhi_points"] == round(conc["hhi"] * 10000, 1)
+
+
+@pytest.mark.parametrize("k", range(1, 9))
+def test_hhi_points_is_derivable_from_returned_hhi(k):
+    """HHI 点数必须等于返回值小数口径 ×10000（读者会去乘，乘出来必须一样）。
+
+    锁的是一个**既有缺陷**：``hhi`` 取整到 4 位、``hhi_points`` 却用**未取整**的值算，
+    于是等权 k 只标的（k=3/6/7…）会印出 ``HHI：0.3333（3333.3 点）`` —— 读者用
+    0.3333×10000 得 3333.0，差 0.3 点（实测 417 组随机/边界输入里 319 组对不上）。
+    现改为两个口径都从同一个定稿值派生。
+    """
+    positions = [_pos(f"{600000 + i}", 100.0 / k) for i in range(k)]
+    conc = pa.compute_concentration(positions, warnings=[])
+
+    assert conc["hhi_points"] == round(conc["hhi"] * 10000, 1)
+    # 等权 k 只：hhi = 1/k，点数口径应落在真值 (±0.5 点，即 4 位小数的舍入上限) 内
+    assert conc["hhi_points"] == pytest.approx(10000.0 / k, abs=0.5)
 
 
 # --------------------------------------------------------------------------- #
